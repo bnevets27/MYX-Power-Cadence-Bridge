@@ -5,7 +5,7 @@
 
 An ESP32 firmware that bridges the **BODi MYX** bike's proprietary Bluetooth sensor to any standard cycling app — Zwift, TrainerRoad, Wahoo, Garmin, Apple Fitness+, and more.
 
-The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unreadable by third-party apps. This firmware runs on a ~$6 ESP32 dev board, decodes the data in real time, and re-broadcasts it as a fully compliant BLE Cycling Power + Speed & Cadence sensor.
+The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unreadable by third-party apps. This firmware runs on a ESP32 dev board, decodes the data in real time, and re-broadcasts it as a fully compliant BLE Cycling Power + Speed & Cadence sensor.
 
 ---
 
@@ -29,7 +29,7 @@ The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unr
 Any ESP32 dev board works. Recommended:
 
 - **ESP32-DevKitC** or **ESP32-WROOM-32** (~$5–8 on Amazon or AliExpress)
-- Micro-USB cable for flashing, then any USB power source to run it
+- USB-C or Mirco USB data cable for flashing depending on which your decice has. Then any suitable USB power source to run it
 
 No soldering or extra components required.
 
