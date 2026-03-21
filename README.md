@@ -26,9 +26,9 @@ The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unr
 
 ## Hardware
 
-Any ESP32 dev board works. Recommended:
+Any ESP32 dev board should work. Recommended:
 
-- **ESP32-DevKitC** or **ESP32-WROOM-32** (~$5–8 on Amazon or AliExpress)
+- **ESP32-DevKitC** or **ESP32-WROOM-32**
 - USB-C or Mirco USB data cable for flashing depending on which your decice has. Then any suitable USB power source to run it
 
 No soldering or extra components required.
