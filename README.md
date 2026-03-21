@@ -15,7 +15,6 @@ The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unr
 |--------|-----------|
 | Power (watts) | ✅ |
 | Cadence (RPM) | ✅ |
-| Speed | ❌ Stationary bike — no wheel data |
 
 - Auto-connects to any nearby MYX bike sensor on boot — no configuration needed
 - Supports multiple simultaneous app connections (Zwift + phone, etc.)
