@@ -49,10 +49,11 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-// ── WiFi & Web ──
+// ── WiFi & Web & OTA ──
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
+#include <Update.h>
 
 // ── MQTT ──
 #include <PubSubClient.h>
@@ -899,6 +900,7 @@ void handleWebRoot() {
     html += "</div>";
 
     // Actions
+    html += "<a href='/update' class='btn'>Firmware Update (OTA)</a>";
     html += "<a href='/reset' class='btn btn-danger' onclick=\"return confirm('Reset WiFi and MQTT settings? Device will restart in AP mode.')\">Reset WiFi &amp; MQTT Settings</a>";
 
     html += "</body></html>";
@@ -948,6 +950,90 @@ void handleWebReset() {
     ESP.restart();
 }
 
+// ─── OTA Firmware Update Handlers ───────────────────────────────────────────
+
+void handleOtaPage() {
+    String html = "<!DOCTYPE html><html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>MYX Bridge - Firmware Update</title>";
+    html += "<style>";
+    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;";
+    html += "max-width:600px;margin:0 auto;padding:20px;background:#1a1a2e;color:#e0e0e0}";
+    html += "h1{color:#00d4ff;text-align:center}";
+    html += ".card{background:#16213e;border-radius:12px;padding:20px;margin:16px 0;";
+    html += "border:1px solid #0f3460;text-align:center}";
+    html += ".card p{color:#888;margin:8px 0 16px}";
+    html += "input[type=file]{color:#e0e0e0;margin:12px 0}";
+    html += ".btn{display:inline-block;padding:12px 32px;margin:12px 4px 0;background:#533483;";
+    html += "color:#fff;border:none;border-radius:8px;font-size:1em;cursor:pointer;text-decoration:none}";
+    html += ".btn:hover{background:#6c44a0}";
+    html += ".btn-upload{background:#0f3460}.btn-upload:hover{background:#1a4a7a}";
+    html += "#prog{width:100%;margin:12px 0;display:none}";
+    html += "#status{margin:12px 0;font-weight:600}";
+    html += ".warn{color:#f39c12;font-size:0.9em}";
+    html += "</style></head><body>";
+    html += "<h1>Firmware Update</h1>";
+    html += "<div class='card'>";
+    html += "<p>Current version: <b>" + String(FW_VERSION) + "</b></p>";
+    html += "<form method='POST' action='/update' enctype='multipart/form-data' id='uf'>";
+    html += "<input type='file' name='firmware' accept='.bin' required><br>";
+    html += "<input type='submit' value='Upload &amp; Flash' class='btn btn-upload'>";
+    html += "</form>";
+    html += "<progress id='prog' max='100' value='0'></progress>";
+    html += "<div id='status'></div>";
+    html += "<p class='warn'>Do not power off during update!</p>";
+    html += "</div>";
+    html += "<a href='/' class='btn'>Back</a>";
+    html += "<script>";
+    html += "document.getElementById('uf').addEventListener('submit',function(e){";
+    html += "e.preventDefault();var f=new FormData(this);var x=new XMLHttpRequest();";
+    html += "var p=document.getElementById('prog');var s=document.getElementById('status');";
+    html += "p.style.display='block';s.textContent='Uploading...';";
+    html += "x.upload.addEventListener('progress',function(ev){";
+    html += "if(ev.lengthComputable)p.value=Math.round(ev.loaded/ev.total*100);});";
+    html += "x.onreadystatechange=function(){if(x.readyState==4){";
+    html += "if(x.status==200){s.textContent='Success! Rebooting...';s.style.color='#00ff88';";
+    html += "setTimeout(function(){location.href='/';},8000);}";
+    html += "else{s.textContent='Update failed: '+x.responseText;s.style.color='#ff4444';}}};";
+    html += "x.open('POST','/update');x.send(f);});";
+    html += "</script>";
+    html += "</body></html>";
+    webServer.send(200, "text/html", html);
+}
+
+void handleOtaUpload() {
+    HTTPUpload& upload = webServer.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        Serial.printf("[OTA] Begin: %s\n", upload.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+            Update.printError(Serial);
+        }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            Update.printError(Serial);
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+            Serial.printf("[OTA] Success! %u bytes written\n", upload.totalSize);
+        } else {
+            Update.printError(Serial);
+        }
+    }
+}
+
+void handleOtaResult() {
+    if (Update.hasError()) {
+        String msg = "Update failed.";
+        webServer.send(400, "text/plain", msg);
+    } else {
+        webServer.send(200, "text/plain", "OK");
+        delay(1000);
+        ESP.restart();
+    }
+}
+
 void handleWebNotFound() {
     webServer.send(404, "text/plain", "Not found");
 }
@@ -955,6 +1041,8 @@ void handleWebNotFound() {
 void setupWebServer() {
     webServer.on("/", handleWebRoot);
     webServer.on("/api/status", handleWebJson);
+    webServer.on("/update", HTTP_GET, handleOtaPage);
+    webServer.on("/update", HTTP_POST, handleOtaResult, handleOtaUpload);
     webServer.on("/reset", handleWebReset);
     webServer.onNotFound(handleWebNotFound);
     webServer.begin();
