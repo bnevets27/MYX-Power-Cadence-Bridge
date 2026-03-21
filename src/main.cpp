@@ -14,6 +14,7 @@
  *   Feature:       0x2A65 (Read)   - value 0x80000000
  *   Sensor Loc:    0x2A5D (Read)   - value 0x04 (Front Wheel)
  *   Manufacturer:  MYX_Power_Meter
+ *   Battery:       0x180F / 0x2A19 (Read+Notify) — plain uint8, 0-100%
  *
  * Decoded 10-byte payload (after XOR 0xAA):
  *   bytes 0-1:  flags                  uint16 LE  (always 0x0820)
@@ -52,6 +53,10 @@ static BLEUUID CPS_FEATURE_UUID((uint16_t)0x2A65);      // Read
 static BLEUUID SENSOR_LOCATION_UUID((uint16_t)0x2A5D);  // Read
 static BLEUUID CPS_CONTROL_POINT_UUID((uint16_t)0x2A66); // Write + Indicate
 
+// Standard Bluetooth Battery Service
+static BLEUUID BATTERY_SERVICE_UUID((uint16_t)0x180F);
+static BLEUUID BATTERY_LEVEL_UUID((uint16_t)0x2A19);
+
 // Standard Bluetooth Cycling Speed & Cadence Service
 // Many apps read cadence from CSC rather than from CPS crank data
 static BLEUUID CSC_SERVICE_UUID((uint16_t)0x1816);
@@ -74,10 +79,12 @@ static BLECharacteristic* powerFeatureChar = nullptr;
 static BLECharacteristic* sensorLocationChar = nullptr;
 static BLECharacteristic* powerControlPointChar = nullptr;
 static BLECharacteristic* cscMeasurementChar = nullptr;
+static BLECharacteristic* batteryLevelChar = nullptr;
 static bool clientSubscribed = false;
 static int appConnectionCount = 0;
 
 // Latest decoded data for serial output
+static volatile uint8_t  lastBattery = 0xFF;  // 0xFF = unknown
 static volatile int16_t  lastPower = 0;
 static volatile uint16_t lastCrankRev = 0;
 static volatile uint16_t lastCrankTime = 0;
@@ -94,6 +101,24 @@ static unsigned long lastBlinkTime = 0;
 static bool ledState = false;
 
 // ─── Utility Functions ──────────────────────────────────────────────────────
+
+/**
+ * Called when the sensor sends a Battery Level notification.
+ */
+static void batteryNotifyCallback(
+    BLERemoteCharacteristic* pChar,
+    uint8_t* pData,
+    size_t length,
+    bool isNotify)
+{
+    if (length < 1) return;
+    lastBattery = pData[0];
+    Serial.printf("[BATTERY] Level: %d%%\n", lastBattery);
+    if (batteryLevelChar != nullptr) {
+        batteryLevelChar->setValue(pData, 1);
+        batteryLevelChar->notify();
+    }
+}
 
 /**
  * XOR-decode a buffer in place with the mask byte.
@@ -381,6 +406,35 @@ bool connectToSensor() {
         Serial.println();
     }
 
+    // ── Battery Service (0x180F / 0x2A19) ──
+    BLERemoteService* remoteBattService = bleClient->getService(BATTERY_SERVICE_UUID);
+    if (remoteBattService != nullptr) {
+        BLERemoteCharacteristic* remoteBattChar = remoteBattService->getCharacteristic(BATTERY_LEVEL_UUID);
+        if (remoteBattChar != nullptr) {
+            // Initial read
+            if (remoteBattChar->canRead()) {
+                std::string battVal = remoteBattChar->readValue();
+                if (battVal.length() > 0) {
+                    lastBattery = (uint8_t)battVal[0];
+                    Serial.printf("[SENSOR] Battery Level: %d%%\n", lastBattery);
+                    if (batteryLevelChar != nullptr) {
+                        uint8_t bv = lastBattery;
+                        batteryLevelChar->setValue(&bv, 1);
+                    }
+                }
+            }
+            // Subscribe to notifications
+            if (remoteBattChar->canNotify()) {
+                remoteBattChar->registerForNotify(batteryNotifyCallback);
+                Serial.println("[SENSOR] Subscribed to battery notifications!");
+            }
+        } else {
+            Serial.println("[SENSOR] Battery Level characteristic (0x2A19) not found");
+        }
+    } else {
+        Serial.println("[SENSOR] Battery Service (0x180F) not found");
+    }
+
     sensorConnected = true;
     return true;
 }
@@ -479,13 +533,26 @@ void setupBLEServer() {
     modelChar->setValue("BikePower Bridge v1");
     BLECharacteristic* fwRevChar = disService->createCharacteristic(
         BLEUUID((uint16_t)0x2A26), BLECharacteristic::PROPERTY_READ);
-    fwRevChar->setValue("1.0.0");
+    fwRevChar->setValue("1.0.1");
     disService->start();
+
+    // ── Battery Service (0x180F) ──
+    // Re-broadcasts the sensor's battery level so apps can show it.
+    BLEService* battService = bleServer->createService(BATTERY_SERVICE_UUID, 8);
+    batteryLevelChar = battService->createCharacteristic(
+        BATTERY_LEVEL_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    batteryLevelChar->addDescriptor(new BLE2902());
+    uint8_t initBatt = 0;
+    batteryLevelChar->setValue(&initBatt, 1);
+    battService->start();
 
     // Set up advertising
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(CPS_SERVICE_UUID);
     pAdvertising->addServiceUUID(CSC_SERVICE_UUID);
+    pAdvertising->addServiceUUID(BATTERY_SERVICE_UUID);
     pAdvertising->setAppearance(0x0484);   // Cycling Power Sensor
     pAdvertising->setScanResponse(true);
     pAdvertising->setMinPreferred(0x06);   // Connection interval min (7.5 ms)
@@ -583,11 +650,15 @@ void loop() {
     static unsigned long lastStatusTime = 0;
     if (now - lastStatusTime > 10000) {
         lastStatusTime = now;
-        Serial.printf("[STATUS] Sensor: %s | Apps: %d | Last Power: %d W | Cadence: %.0f RPM\n",
+        char battStr[8];
+        if (lastBattery == 0xFF) snprintf(battStr, sizeof(battStr), "?");
+        else snprintf(battStr, sizeof(battStr), "%d%%", lastBattery);
+        Serial.printf("[STATUS] Sensor: %s | Apps: %d | Power: %d W | Cadence: %.0f RPM | Battery: %s\n",
                       sensorConnected ? "CONNECTED" : "SEARCHING",
                       appConnectionCount,
                       (int)lastPower,
-                      lastCadence);
+                      lastCadence,
+                      battStr);
     }
 
     delay(10);
