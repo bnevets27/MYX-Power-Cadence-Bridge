@@ -55,6 +55,9 @@
 #include <WiFiManager.h>
 #include <Update.h>
 
+// ── BT memory release ──
+#include "esp_bt.h"
+
 // ── MQTT ──
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -64,7 +67,7 @@
 
 // ─── Version ────────────────────────────────────────────────────────────────
 
-static const char* FW_VERSION = "2.0.0";
+static const char* FW_VERSION = "2.0.3";
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -150,6 +153,7 @@ static volatile uint16_t lastEnergy = 0;
 // For cadence calculation
 static uint16_t prevCrankRev = 0;
 static uint16_t prevCrankTime = 0;
+static unsigned long lastCrankEventMs = 0;  // millis() of last actual crank movement
 static float    lastCadence = 0.0f;
 
 // WiFi & MQTT
@@ -330,17 +334,19 @@ static void notifyCallback(
     lastCrankTime = cTime;
     lastEnergy   = energy;
 
-    // Calculate cadence
-    float cadence = calcCadence(cRev, cTime, prevCrankRev, prevCrankTime);
-    if (cadence > 0.0f && cadence < 200.0f) {
-        lastCadence = cadence;
-    } else if (cRev != prevCrankRev) {
-        // Crank moved but cadence out of range — keep last known
-    } else {
-        lastCadence = 0.0f;  // No movement
+    // Calculate cadence — only update on actual crank movement,
+    // and only zero out after 3 seconds of no new crank events
+    if (cRev != prevCrankRev) {
+        float cadence = calcCadence(cRev, cTime, prevCrankRev, prevCrankTime);
+        if (cadence > 0.0f && cadence < 200.0f) {
+            lastCadence = cadence;
+        }
+        lastCrankEventMs = millis();
+        prevCrankRev  = cRev;
+        prevCrankTime = cTime;
+    } else if (lastCadence > 0.0f && (millis() - lastCrankEventMs > 3000)) {
+        lastCadence = 0.0f;  // No movement for 3 s
     }
-    prevCrankRev  = cRev;
-    prevCrankTime = cTime;
 
     // ── Re-broadcast as standard Cycling Power Measurement ──
     // Flags 0x0020 = bit 5 (Crank Revolution Data Present)
@@ -815,6 +821,8 @@ void setupWiFi() {
 // ─── Web Server Handlers ────────────────────────────────────────────────────
 
 void handleWebRoot() {
+    // Snapshot values for the initial paint so the page is useful before
+    // the first JS fetch fires.
     unsigned long uptime = millis() / 1000;
     unsigned long days  = uptime / 86400;
     unsigned long hours = (uptime % 86400) / 3600;
@@ -825,86 +833,196 @@ void handleWebRoot() {
     if (lastBattery == 0xFF) snprintf(battStr, sizeof(battStr), "?");
     else snprintf(battStr, sizeof(battStr), "%d%%", lastBattery);
 
-    String html = "<!DOCTYPE html><html><head>";
-    html += "<meta charset='UTF-8'>";
-    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-    html += "<meta http-equiv='refresh' content='3'>";
-    html += "<title>MYX Bridge</title>";
-    html += "<style>";
-    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;";
-    html += "max-width:600px;margin:0 auto;padding:20px;background:#1a1a2e;color:#e0e0e0}";
-    html += "h1{color:#00d4ff;text-align:center;margin-bottom:5px}";
-    html += ".subtitle{text-align:center;color:#888;margin-bottom:20px}";
-    html += ".card{background:#16213e;border-radius:12px;padding:16px;margin:12px 0;";
-    html += "border:1px solid #0f3460}";
-    html += ".card h2{margin:0 0 12px;font-size:1.1em;color:#00d4ff}";
-    html += ".row{display:flex;justify-content:space-between;padding:6px 0;";
-    html += "border-bottom:1px solid #0f3460}";
-    html += ".row:last-child{border-bottom:none}";
-    html += ".label{color:#888}.value{font-weight:600;color:#fff}";
-    html += ".big{font-size:2.2em;text-align:center;color:#00ff88;margin:8px 0}";
-    html += ".online{color:#00ff88}.offline{color:#ff4444}";
-    html += ".btn{display:block;width:100%;padding:12px;margin:16px 0 0;background:#533483;";
-    html += "color:#fff;border:none;border-radius:8px;font-size:1em;cursor:pointer;text-align:center;text-decoration:none}";
-    html += ".btn:hover{background:#6c44a0}";
-    html += ".btn-danger{background:#c0392b}.btn-danger:hover{background:#e74c3c}";
-    html += "</style></head><body>";
-
-    html += "<h1>MYX Bridge</h1>";
-    html += "<div class='subtitle'>v" + String(FW_VERSION) + " &bull; Refreshes every 3s</div>";
-
-    // Power (big display)
-    html += "<div class='card'><h2>Power</h2>";
-    html += "<div class='big'>" + String((int)lastPower) + " W</div>";
-    html += "</div>";
-
-    // Sensor data
-    html += "<div class='card'><h2>Sensor Data</h2>";
-    html += "<div class='row'><span class='label'>Cadence</span><span class='value'>" +
-            String(lastCadence, 1) + " RPM</span></div>";
-    html += "<div class='row'><span class='label'>Battery</span><span class='value'>" +
-            String(battStr) + "</span></div>";
-    html += "<div class='row'><span class='label'>Energy</span><span class='value'>" +
-            String((int)lastEnergy) + " kJ</span></div>";
-    html += "<div class='row'><span class='label'>Crank Revs</span><span class='value'>" +
-            String((int)lastCrankRev) + "</span></div>";
-    html += "</div>";
-
-    // Connections
-    html += "<div class='card'><h2>Connections</h2>";
-    html += "<div class='row'><span class='label'>BLE Sensor</span><span class='value " +
-            String(sensorConnected ? "online'>Connected" : "offline'>Searching") + "</span></div>";
-    html += "<div class='row'><span class='label'>BLE Apps</span><span class='value'>" +
-            String(appConnectionCount) + "</span></div>";
-    html += "<div class='row'><span class='label'>WiFi</span><span class='value online'>" +
-            WiFi.localIP().toString() + "</span></div>";
-    html += "<div class='row'><span class='label'>MQTT</span><span class='value " +
-            String(mqttConnected ? "online'>Connected" : "offline'>Disconnected") + "</span></div>";
-    if (mqttConfigured) {
-        html += "<div class='row'><span class='label'>MQTT Broker</span><span class='value'>" +
-                String(mqttConfig.server) + ":" + String(mqttConfig.port) + "</span></div>";
-    }
-    html += "</div>";
-
-    // Device info
-    html += "<div class='card'><h2>Device</h2>";
     char uptimeStr[32];
     if (days > 0) snprintf(uptimeStr, sizeof(uptimeStr), "%lud %02lu:%02lu:%02lu", days, hours, mins, secs);
     else snprintf(uptimeStr, sizeof(uptimeStr), "%02lu:%02lu:%02lu", hours, mins, secs);
-    html += "<div class='row'><span class='label'>Uptime</span><span class='value'>" +
-            String(uptimeStr) + "</span></div>";
-    html += "<div class='row'><span class='label'>Device ID</span><span class='value'>" +
-            String(deviceId) + "</span></div>";
-    html += "<div class='row'><span class='label'>Free Heap</span><span class='value'>" +
-            String(ESP.getFreeHeap() / 1024) + " KB</span></div>";
-    html += "</div>";
 
-    // Actions
-    html += "<a href='/update' class='btn'>Firmware Update (OTA)</a>";
-    html += "<a href='/reset' class='btn btn-danger' onclick=\"return confirm('Reset WiFi and MQTT settings? Device will restart in AP mode.')\">Reset WiFi &amp; MQTT Settings</a>";
+    // Stream response in fixed-size chunks — no large heap allocations
+    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webServer.send(200, "text/html", "");
 
-    html += "</body></html>";
-    webServer.send(200, "text/html", html);
+    // ── Head + CSS ──────────────────────────────────────────────────────────
+    webServer.sendContent(
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>MYX Bridge</title>"
+        "<style>"
+        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+        "max-width:600px;margin:0 auto;padding:20px;background:#1a1a2e;color:#e0e0e0}"
+        "h1{color:#00d4ff;text-align:center;margin-bottom:5px}"
+        ".subtitle{text-align:center;color:#888;margin-bottom:20px}"
+        ".card{background:#16213e;border-radius:12px;padding:16px;margin:12px 0;"
+        "border:1px solid #0f3460}"
+        ".card h2{margin:0 0 12px;font-size:1.1em;color:#00d4ff}"
+        ".row{display:flex;justify-content:space-between;padding:6px 0;"
+        "border-bottom:1px solid #0f3460}"
+        ".row:last-child{border-bottom:none}"
+        ".label{color:#888}"
+        ".value{font-weight:600;color:#fff}"
+        ".big{font-size:2.2em;text-align:center;color:#00ff88;margin:8px 0}"
+        ".online{color:#00ff88}"
+        ".offline{color:#ff4444}"
+        ".btn{display:block;width:100%;padding:12px;margin:16px 0 0;background:#533483;"
+        "color:#fff;border:none;border-radius:8px;font-size:1em;cursor:pointer;"
+        "text-align:center;text-decoration:none;box-sizing:border-box}"
+        ".btn:hover{background:#6c44a0}"
+        ".btn-danger{background:#c0392b}"
+        ".btn-danger:hover{background:#e74c3c}"
+        "</style></head><body>"
+    );
+
+    // ── Header ───────────────────────────────────────────────────────────────
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "<h1>MYX Bridge</h1>"
+        "<div class='subtitle'>v%s &bull; Live data</div>",
+        FW_VERSION);
+    webServer.sendContent(buf);
+
+    // ── Power card (initial server-side value, updated by JS) ────────────────
+    snprintf(buf, sizeof(buf),
+        "<div class='card'><h2>Power</h2>"
+        "<div class='big' id='val-power'>%d W</div>"
+        "</div>",
+        (int)lastPower);
+    webServer.sendContent(buf);
+
+    // ── Sensor Data card (one row per sendContent to stay within buf[256]) ──
+    webServer.sendContent("<div class='card'><h2>Sensor Data</h2>");
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>Cadence</span>"
+        "<span class='value' id='val-cadence'>%.1f RPM</span></div>",
+        lastCadence);
+    webServer.sendContent(buf);
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>Battery</span>"
+        "<span class='value' id='val-battery'>%s</span></div>",
+        battStr);
+    webServer.sendContent(buf);
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>Energy</span>"
+        "<span class='value' id='val-energy'>%d kJ</span></div>",
+        (int)lastEnergy);
+    webServer.sendContent(buf);
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>Crank Revs</span>"
+        "<span class='value' id='val-cranks'>%d</span></div>",
+        (int)lastCrankRev);
+    webServer.sendContent(buf);
+
+    webServer.sendContent("</div>");  // end Sensor Data card
+
+    // ── Connections card (split into small chunks to stay within buf[256]) ──
+    webServer.sendContent("<div class='card'><h2>Connections</h2>");
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>BLE Sensor</span>"
+        "<span class='value %s' id='val-ble-sensor'>%s</span></div>",
+        sensorConnected ? "online" : "offline",
+        sensorConnected ? "Connected" : "Searching");
+    webServer.sendContent(buf);
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>BLE Apps</span>"
+        "<span class='value' id='val-ble-apps'>%d</span></div>",
+        appConnectionCount);
+    webServer.sendContent(buf);
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>WiFi</span>"
+        "<span class='value online' id='val-wifi'>%s</span></div>",
+        WiFi.localIP().toString().c_str());
+    webServer.sendContent(buf);
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>MQTT</span>"
+        "<span class='value %s' id='val-mqtt'>%s</span></div>",
+        mqttConnected ? "online" : "offline",
+        mqttConnected ? "Connected" : "Disconnected");
+    webServer.sendContent(buf);
+
+    if (mqttConfigured) {
+        snprintf(buf, sizeof(buf),
+            "<div class='row'><span class='label'>MQTT Broker</span>"
+            "<span class='value'>%s:%d</span></div>",
+            mqttConfig.server, mqttConfig.port);
+        webServer.sendContent(buf);
+    }
+    webServer.sendContent("</div>");  // end Connections card
+
+    // ── Device card (one row per sendContent) ────────────────────────────────
+    webServer.sendContent("<div class='card'><h2>Device</h2>");
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>Uptime</span>"
+        "<span class='value' id='val-uptime'>%s</span></div>",
+        uptimeStr);
+    webServer.sendContent(buf);
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>Device ID</span>"
+        "<span class='value'>%s</span></div>",
+        deviceId);
+    webServer.sendContent(buf);
+
+    snprintf(buf, sizeof(buf),
+        "<div class='row'><span class='label'>Free Heap</span>"
+        "<span class='value' id='val-heap'>%d KB</span></div>",
+        (int)(ESP.getFreeHeap() / 1024));
+    webServer.sendContent(buf);
+
+    webServer.sendContent("</div>");  // end Device card
+
+    // ── Buttons ──────────────────────────────────────────────────────────────
+    webServer.sendContent(
+        "<a href='/update' class='btn'>Firmware Update (OTA)</a>"
+        "<a href='/reset' class='btn btn-danger'"
+        " onclick=\"return confirm('Reset WiFi and MQTT settings? Device will restart in AP mode.')\">"
+        "Reset WiFi &amp; MQTT Settings</a>"
+    );
+
+    // ── JS live-update (no full page reload) ─────────────────────────────────
+    // fetch /api/status every 5 s and patch only the changed DOM nodes
+    webServer.sendContent(
+        "<script>"
+        "function fmtUptime(s){"
+        "var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),"
+        "m=Math.floor((s%3600)/60),sc=s%60;"
+        "var p=function(n){return n<10?'0'+n:n;};"
+        "return d>0?d+'d '+p(h)+':'+p(m)+':'+p(sc):p(h)+':'+p(m)+':'+p(sc);}"
+        "function upd(id,v){var e=document.getElementById(id);if(e)e.textContent=v;}"
+        "function setClass(id,cls){"
+        "var e=document.getElementById(id);"
+        "if(e){e.className='value '+cls;}}"
+        "function refresh(){"
+        "fetch('/api/status').then(function(r){return r.json();})"
+        ".then(function(d){"
+        "upd('val-power',d.power+' W');"
+        "upd('val-cadence',d.cadence.toFixed(1)+' RPM');"
+        "upd('val-battery',d.battery<0?'?':d.battery+'%');"
+        "upd('val-energy',d.energy+' kJ');"
+        "upd('val-cranks',d.crank_revs);"
+        "var sc=d.ble_sensor?'online':'offline';"
+        "upd('val-ble-sensor',d.ble_sensor?'Connected':'Searching');"
+        "setClass('val-ble-sensor',sc);"
+        "upd('val-ble-apps',d.ble_apps);"
+        "var mc=d.mqtt_connected?'online':'offline';"
+        "upd('val-mqtt',d.mqtt_connected?'Connected':'Disconnected');"
+        "setClass('val-mqtt',mc);"
+        "upd('val-uptime',fmtUptime(d.uptime_s));"
+        "upd('val-heap',Math.round(d.free_heap/1024)+' KB');"
+        "}).catch(function(){});}"
+        "setInterval(refresh,5000);"
+        "</script>"
+    );
+
+    webServer.sendContent("</body></html>");
+    webServer.sendContent("");  // signal end of chunked response
 }
 
 void handleWebJson() {
@@ -953,53 +1071,109 @@ void handleWebReset() {
 // ─── OTA Firmware Update Handlers ───────────────────────────────────────────
 
 void handleOtaPage() {
-    String html = "<!DOCTYPE html><html><head>";
-    html += "<meta charset='UTF-8'>";
-    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-    html += "<title>MYX Bridge - Firmware Update</title>";
-    html += "<style>";
-    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;";
-    html += "max-width:600px;margin:0 auto;padding:20px;background:#1a1a2e;color:#e0e0e0}";
-    html += "h1{color:#00d4ff;text-align:center}";
-    html += ".card{background:#16213e;border-radius:12px;padding:20px;margin:16px 0;";
-    html += "border:1px solid #0f3460;text-align:center}";
-    html += ".card p{color:#888;margin:8px 0 16px}";
-    html += "input[type=file]{color:#e0e0e0;margin:12px 0}";
-    html += ".btn{display:inline-block;padding:12px 32px;margin:12px 4px 0;background:#533483;";
-    html += "color:#fff;border:none;border-radius:8px;font-size:1em;cursor:pointer;text-decoration:none}";
-    html += ".btn:hover{background:#6c44a0}";
-    html += ".btn-upload{background:#0f3460}.btn-upload:hover{background:#1a4a7a}";
-    html += "#prog{width:100%;margin:12px 0;display:none}";
-    html += "#status{margin:12px 0;font-weight:600}";
-    html += ".warn{color:#f39c12;font-size:0.9em}";
-    html += "</style></head><body>";
-    html += "<h1>Firmware Update</h1>";
-    html += "<div class='card'>";
-    html += "<p>Current version: <b>" + String(FW_VERSION) + "</b></p>";
-    html += "<form method='POST' action='/update' enctype='multipart/form-data' id='uf'>";
-    html += "<input type='file' name='firmware' accept='.bin' required><br>";
-    html += "<input type='submit' value='Upload &amp; Flash' class='btn btn-upload'>";
-    html += "</form>";
-    html += "<progress id='prog' max='100' value='0'></progress>";
-    html += "<div id='status'></div>";
-    html += "<p class='warn'>Do not power off during update!</p>";
-    html += "</div>";
-    html += "<a href='/' class='btn'>Back</a>";
-    html += "<script>";
-    html += "document.getElementById('uf').addEventListener('submit',function(e){";
-    html += "e.preventDefault();var f=new FormData(this);var x=new XMLHttpRequest();";
-    html += "var p=document.getElementById('prog');var s=document.getElementById('status');";
-    html += "p.style.display='block';s.textContent='Uploading...';";
-    html += "x.upload.addEventListener('progress',function(ev){";
-    html += "if(ev.lengthComputable)p.value=Math.round(ev.loaded/ev.total*100);});";
-    html += "x.onreadystatechange=function(){if(x.readyState==4){";
-    html += "if(x.status==200){s.textContent='Success! Rebooting...';s.style.color='#00ff88';";
-    html += "setTimeout(function(){location.href='/';},8000);}";
-    html += "else{s.textContent='Update failed: '+x.responseText;s.style.color='#ff4444';}}};";
-    html += "x.open('POST','/update');x.send(f);});";
-    html += "</script>";
-    html += "</body></html>";
-    webServer.send(200, "text/html", html);
+    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webServer.send(200, "text/html", "");
+
+    // Send head and CSS as plain string literals — no snprintf, no buffer overflow risk
+    webServer.sendContent("<!DOCTYPE html><html><head>");
+    webServer.sendContent("<meta charset='UTF-8'>");
+    webServer.sendContent("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+    webServer.sendContent("<title>MYX Bridge - Firmware Update</title>");
+    webServer.sendContent(
+        "<style>"
+        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+        "max-width:600px;margin:0 auto;padding:20px;background:#1a1a2e;color:#e0e0e0}"
+        "h1{color:#00d4ff;text-align:center}"
+        ".card{background:#16213e;border-radius:12px;padding:20px;margin:16px 0;"
+        "border:1px solid #0f3460;text-align:center}"
+        ".card p{color:#888;margin:8px 0 16px}"
+        "input[type=file]{color:#e0e0e0;margin:12px 0;display:block;width:100%}"
+        ".btn{display:inline-block;padding:12px 32px;margin:12px 4px 0;background:#533483;"
+        "color:#fff;border:none;border-radius:8px;font-size:1em;cursor:pointer;text-decoration:none}"
+        ".btn:hover{background:#6c44a0}"
+        ".btn-upload{background:#0f3460}.btn-upload:hover{background:#1a4a7a}"
+        "progress{width:100%;margin:12px 0;display:none}"
+        "#status{margin:12px 0;font-weight:600}"
+        ".warn{color:#f39c12;font-size:0.9em}"
+        "</style></head><body>"
+    );
+
+    webServer.sendContent("<h1>Firmware Update</h1><div class='card'>");
+
+    // Only version string needs snprintf
+    char vbuf[64];
+    snprintf(vbuf, sizeof(vbuf), "<p>Current version: <b>%s</b></p>", FW_VERSION);
+    webServer.sendContent(vbuf);
+
+    webServer.sendContent(
+        "<form id='uf'>"
+        "<input type='file' id='fbin' name='firmware' accept='.bin' required>"
+        "<br>"
+        "<button type='submit' class='btn btn-upload' id='btn'>Upload &amp; Flash</button>"
+        "</form>"
+        "<div id='bar-wrap' style='display:none;background:#0f3460;border-radius:8px;margin:16px 0;height:24px;overflow:hidden'>"
+        "<div id='bar' style='height:100%;width:0;background:#00d4ff;transition:width 0.3s'></div>"
+        "</div>"
+        "<div id='pct' style='display:none;color:#888;font-size:0.9em;margin:-8px 0 8px'></div>"
+        "<div id='status' style='font-size:1.1em;font-weight:600;min-height:1.5em'></div>"
+        "<p class='warn'>&#9888; Do not power off during update!</p>"
+        "</div>"
+    );
+
+    webServer.sendContent("<a href='/' class='btn' id='back'>&#8592; Back</a>");
+
+    webServer.sendContent(
+        "<script>"
+        "function setStatus(msg,col){"
+        "var s=document.getElementById('status');"
+        "s.textContent=msg;s.style.color=col||'#e0e0e0';}"
+        "function setBar(pct){"
+        "document.getElementById('bar').style.width=pct+'%';"
+        "document.getElementById('pct').textContent=pct+'%';}"
+        "document.getElementById('uf').addEventListener('submit',function(e){"
+        "e.preventDefault();"
+        "var file=document.getElementById('fbin').files[0];"
+        "if(!file){setStatus('Please select a .bin file.','#ff4444');return;}"
+        "document.getElementById('btn').disabled=true;"
+        "document.getElementById('back').style.pointerEvents='none';"
+        "document.getElementById('back').style.opacity='0.4';"
+        "document.getElementById('bar-wrap').style.display='block';"
+        "document.getElementById('pct').style.display='block';"
+        "setBar(0);"
+        "setStatus('Uploading firmware...','#00d4ff');"
+        "var fd=new FormData();"
+        "fd.append('firmware',file);"
+        "var xhr=new XMLHttpRequest();"
+        "xhr.upload.onprogress=function(ev){"
+        "if(ev.lengthComputable){"
+        "var p=Math.round(ev.loaded/ev.total*100);"
+        "setBar(p);"
+        "if(p<100){setStatus('Uploading... '+p+'%','#00d4ff');}"
+        "else{setStatus('Upload complete. Flashing...','#f39c12');}}};"
+        "xhr.onload=function(){"
+        "if(xhr.status===200){"
+        "setBar(100);"
+        "setStatus('&#10003; Flash complete! Rebooting...','#00ff88');"
+        "var c=12;"
+        "var t=setInterval(function(){"
+        "c--;setStatus('&#10003; Flash complete! Redirecting in '+c+'s...','#00ff88');"
+        "if(c<=0){clearInterval(t);location.href='/';}},1000);"
+        "}else{"
+        "setStatus('Flash failed: '+xhr.responseText,'#ff4444');"
+        "document.getElementById('btn').disabled=false;}};"
+        "xhr.onerror=function(){"
+        "setStatus('Connection lost - device may be rebooting...','#f39c12');"
+        "var c=15;"
+        "var t=setInterval(function(){"
+        "c--;setStatus('Waiting for device... '+c+'s','#f39c12');"
+        "if(c<=0){clearInterval(t);location.href='/';}},1000);};"
+        "xhr.open('POST','/update');"
+        "xhr.send(fd);});"
+        "</script>"
+        "</body></html>"
+    );
+
+    webServer.sendContent("");  // end chunked
 }
 
 void handleOtaUpload() {
@@ -1074,6 +1248,9 @@ void setup() {
     loadMqttConfig();
 
     // Initialize BLE (before WiFi for proper coexistence)
+    // Release Classic BT (BR/EDR) memory — we only need BLE.
+    // This frees ~70KB of heap that bluedroid holds for classic BT.
+    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
     BLEDevice::init(BRIDGE_NAME);
 
     // Set up the BLE server side first (so apps can find us immediately)
