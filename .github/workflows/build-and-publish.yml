@@ -65,7 +65,7 @@ jobs:
 
       - name: Package HA Edition — ESP32 (merge to flashable .bin)
         run: |
-          BOOT_APP=$(find ~/.platformio -name boot_app0.bin -path "*/esp32/*" | head -1)
+          BOOT_APP="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
           echo "boot_app0.bin: $BOOT_APP"
           python -m esptool --chip esp32 merge-bin \
             --output "$HA_ESP32_BIN" \
@@ -77,7 +77,7 @@ jobs:
 
       - name: Package HA Edition — ESP32-S3 (merge to flashable .bin)
         run: |
-          BOOT_APP=$(find ~/.platformio -name boot_app0.bin -path "*/esp32s3/*" | head -1)
+          BOOT_APP="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
           echo "boot_app0.bin: $BOOT_APP"
           python -m esptool --chip esp32s3 merge-bin \
             --output "$HA_S3_BIN" \
