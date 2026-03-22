@@ -46,16 +46,14 @@ The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unr
 
 Any board built on the **original ESP32 chip** (dual-core Xtensa, with both Wi-Fi and BLE) works. Recommended:
 
-- **ESP32-DevKitC** or **ESP32-WROOM-32** — the cheap $5–10 boards on Amazon/AliExpress are fine
+- **ESP32-DevKitC** or **ESP32-WROOM-32**
 - USB-C or Micro USB data cable for the initial flash, then any USB power source
 
 No soldering or extra components required.
 
 > **Compatibility note:** The HA edition needs Wi-Fi **and** BLE running simultaneously, which requires the classic ESP32. Newer variants will **not** work out of the box:
 > - **ESP32-S2** — no BLE, incompatible
-> - **ESP32-C3 / C6** — single-core, different BLE stack, requires code changes
-> - **ESP32-S3** — has BLE + Wi-Fi but needs platform config changes to compile
-> - **ESP8266** — no BLE at all, incompatible
+> - **ESP32-C3 / C6** — not currently supported
 >
 > If the listing says "ESP32-WROOM-32" or "ESP32-DevKitC" you're good. If unsure, check that the chip is labelled **ESP32-D0WD** or **ESP32-D0WDQ6** — those are the classic dual-core modules.
 >
