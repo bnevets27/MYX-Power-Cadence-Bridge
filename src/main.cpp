@@ -44,6 +44,9 @@ static const uint8_t XOR_KEY = 0xAA;
 // The name this ESP32 will advertise to apps (Zwift, etc.)
 static const char* BRIDGE_NAME = "MYX Bridge";
 
+// Firmware version
+static const char* FW_VERSION = "1.0.1";
+
 // ─── BLE UUIDs ──────────────────────────────────────────────────────────────
 
 // Standard Bluetooth Cycling Power Service
