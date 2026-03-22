@@ -18,7 +18,7 @@ The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unr
 > | OTA firmware updates | ❌ | ✅ |
 > | Setup complexity | Plug & play | 5-min Wi-Fi setup |
 >
-> **Not sure?** If you don't use Home Assistant, use the [Basic version](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/tree/main). Download both `.bin` files from the [Releases page](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/releases/latest).
+> **Not sure?** If you don't use Home Assistant, use the [Basic version](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/tree/main). Download either `.bin` files from the [Releases page](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/releases/latest).
 
 ---
 
@@ -44,12 +44,22 @@ The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unr
 
 ## Hardware
 
-Any ESP32 dev board works. Recommended:
+Any board built on the **original ESP32 chip** (dual-core Xtensa, with both Wi-Fi and BLE) works. Recommended:
 
-- **ESP32-DevKitC** or **ESP32-WROOM-32**
+- **ESP32-DevKitC** or **ESP32-WROOM-32** — the cheap $5–10 boards on Amazon/AliExpress are fine
 - USB-C or Micro USB data cable for the initial flash, then any USB power source
 
 No soldering or extra components required.
+
+> **Compatibility note:** The HA edition needs Wi-Fi **and** BLE running simultaneously, which requires the classic ESP32. Newer variants will **not** work out of the box:
+> - **ESP32-S2** — no BLE, incompatible
+> - **ESP32-C3 / C6** — single-core, different BLE stack, requires code changes
+> - **ESP32-S3** — has BLE + Wi-Fi but needs platform config changes to compile
+> - **ESP8266** — no BLE at all, incompatible
+>
+> If the listing says "ESP32-WROOM-32" or "ESP32-DevKitC" you're good. If unsure, check that the chip is labelled **ESP32-D0WD** or **ESP32-D0WDQ6** — those are the classic dual-core modules.
+>
+> Minimum flash: **4MB** (standard on virtually all ESP32 dev boards).
 
 ---
 
@@ -107,12 +117,15 @@ This firmware uses **MQTT Discovery** — no manual YAML configuration needed.
 
 Once the ESP32 connects to your MQTT broker, the following entities appear automatically in Home Assistant under a device named **"MYX Bridge"**:
 
-| Entity | Type | Unit |
-|--------|------|------|
-| Power | Sensor | W |
-| Cadence | Sensor | RPM |
-| Battery | Sensor | % |
-| Energy | Sensor | kJ |
+| Entity | Type | Unit | Notes |
+|--------|------|------|-------|
+| Power | Sensor | W | Instantaneous power output |
+| Cadence | Sensor | RPM | Crank cadence |
+| Battery | Sensor | % | Bike sensor battery level |
+| Energy | Sensor | kJ | Accumulated energy for the session |
+| Sensor Connected | Binary Sensor | — | Whether the bridge has an active BLE link to the bike sensor |
+
+> **About Sensor Connected:** This reflects the BLE connection between the ESP32 bridge and the MYX bike sensor (`BKSNSR*`). **Disconnected is completely normal when you're not riding** — the bike sensor sleeps after a few seconds of no pedalling and drops the connection to save battery. Once you start pedalling again it wakes up and the bridge reconnects automatically within a few seconds. You don't need to restart anything.
 
 Make sure MQTT discovery is enabled in your `configuration.yaml`:
 
@@ -204,4 +217,3 @@ Use the **Reset Config** button at `http://<ip>/reset` or hold the BOOT button f
 ## License
 
 MIT — free to use, modify, and distribute.
-
