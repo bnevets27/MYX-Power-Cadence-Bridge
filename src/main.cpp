@@ -99,7 +99,9 @@ static uint16_t prevCrankTime = 0;
 static float    lastCadence = 0.0f;
 
 // LED feedback
-static const int LED_PIN = 2;  // Built-in LED on most ESP32 boards
+#ifndef LED_PIN
+#define LED_PIN 2  // Built-in LED on most ESP32 boards
+#endif
 static unsigned long lastBlinkTime = 0;
 static bool ledState = false;
 
