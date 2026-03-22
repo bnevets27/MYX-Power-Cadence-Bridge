@@ -7,6 +7,19 @@ An ESP32 firmware that bridges the **BODi MYX** bike's proprietary Bluetooth sen
 
 The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unreadable by third-party apps. This firmware runs on a ESP32 dev board, decodes the data in real time, and re-broadcasts it as a fully compliant BLE Cycling Power + Speed & Cadence sensor.
 
+> **Two versions are available** — choose the one that fits your setup:
+>
+> | | [**Basic (this branch)**](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/tree/main) | [Home Assistant Edition](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/tree/ha-mqtt) |
+> |---|---|---|
+> | BLE bridge (Zwift, Wahoo, etc.) | ✅ | ✅ |
+> | Home Assistant / MQTT | ❌ | ✅ |
+> | Wi-Fi captive portal setup | ❌ | ✅ |
+> | Live debug web UI | ❌ | ✅ |
+> | OTA firmware updates | ❌ | ✅ |
+> | Setup complexity | **Plug & play** | 5-min Wi-Fi setup |
+>
+> **Not sure?** If you don't use Home Assistant, stay here. Download both `.bin` files from the [Releases page](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/releases/latest).
+
 ---
 
 ## Features
