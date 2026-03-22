@@ -110,9 +110,9 @@ jobs:
 
       - name: Package Basic Edition — ESP32-S3 (merge to flashable .bin)
         run: |
-          BOOT_APP=$(find ~/.platformio -name boot_app0.bin -path "*/esp32s3/*" | head -1)
+          BOOT_APP="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
           echo "boot_app0.bin: $BOOT_APP"
-          if [ -n "$BOOT_APP" ]; then
+          if [ -f "$BOOT_APP" ]; then
             python -m esptool --chip esp32s3 merge-bin \
               --output "$BASIC_S3_BIN" \
               --flash-mode dio --flash-freq 80m --flash-size 4MB \
