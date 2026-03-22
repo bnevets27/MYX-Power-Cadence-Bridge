@@ -39,7 +39,7 @@
  *   bytes 6-7:  last_crank_event_time  uint16 LE  (1/1024 s)
  *   bytes 8-9:  accumulated_energy     uint16 LE  (kJ)
  *
- * Hardware: Any ESP32 dev board (ESP32-DevKitC, ESP32-WROOM, etc.)
+ * Hardware: ESP32 or ESP32-S3 dev board (ESP32-DevKitC, ESP32-WROOM, ESP32-S3-DevKitC, etc.)
  */
 
 // ── BLE ──
@@ -55,8 +55,10 @@
 #include <WiFiManager.h>
 #include <Update.h>
 
-// ── BT memory release ──
+// ── BT memory release (classic ESP32 only) ──
+#ifdef CONFIG_IDF_TARGET_ESP32
 #include "esp_bt.h"
+#endif
 
 // ── MQTT ──
 #include <PubSubClient.h>
@@ -171,7 +173,12 @@ static char mqttAvailTopic[48]; // "myx_bridge_aabbcc/availability"
 static WebServer webServer(WEB_PORT);
 
 // LED feedback
-static const int LED_PIN = 2;  // Built-in LED on most ESP32 boards
+// Classic ESP32 DevKitC: GPIO 2 (blue on-board LED)
+// ESP32-S3 DevKitC:     GPIO 2 (directly usable, no RGB)
+// Change this if your board uses a different pin.
+#ifndef LED_PIN
+#define LED_PIN 2
+#endif
 static unsigned long lastBlinkTime = 0;
 static bool ledState = false;
 
@@ -1250,7 +1257,10 @@ void setup() {
     // Initialize BLE (before WiFi for proper coexistence)
     // Release Classic BT (BR/EDR) memory — we only need BLE.
     // This frees ~70KB of heap that bluedroid holds for classic BT.
+    // Only the original ESP32 has classic BT; S3 is BLE-only.
+#ifdef CONFIG_IDF_TARGET_ESP32
     esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+#endif
     BLEDevice::init(BRIDGE_NAME);
 
     // Set up the BLE server side first (so apps can find us immediately)

@@ -44,7 +44,7 @@ jobs:
       - name: Install PlatformIO and esptool
         run: pip install platformio esptool
 
-      - name: Build HA Edition firmware
+      - name: Build HA Edition firmware (ESP32 + S3)
         working-directory: ha-mqtt
         run: pio run
 
@@ -58,23 +58,35 @@ jobs:
           BASIC_VER=$(sed -n 's/.*FW_VERSION\s*=\s*"\([^"]*\)".*/\1/p' basic/src/main.cpp)
           echo "HA_VER=$HA_VER"           >> $GITHUB_ENV
           echo "BASIC_VER=$BASIC_VER"     >> $GITHUB_ENV
-          echo "HA_BIN=esp32-bike-bridge-ha-mqtt-v${HA_VER}.bin"     >> $GITHUB_ENV
-          echo "BASIC_BIN=esp32-bike-bridge-basic-v${BASIC_VER}.bin" >> $GITHUB_ENV
+          echo "HA_ESP32_BIN=esp32-bike-bridge-ha-mqtt-v${HA_VER}.bin"         >> $GITHUB_ENV
+          echo "HA_S3_BIN=esp32s3-bike-bridge-ha-mqtt-v${HA_VER}.bin"          >> $GITHUB_ENV
+          echo "BASIC_BIN=esp32-bike-bridge-basic-v${BASIC_VER}.bin"           >> $GITHUB_ENV
 
-      - name: Package HA Edition (merge to flashable .bin)
+      - name: Package HA Edition — ESP32 (merge to flashable .bin)
         run: |
-          BOOT_APP=$(find ~/.platformio -name boot_app0.bin | head -1)
+          BOOT_APP=$(find ~/.platformio -path "*/esp32/*" -name boot_app0.bin | head -1)
           python -m esptool --chip esp32 merge_bin \
-            --output "$HA_BIN" \
+            --output "$HA_ESP32_BIN" \
             --flash_mode dio --flash_freq 40m --flash_size 4MB \
             0x1000  ha-mqtt/.pio/build/esp32/bootloader.bin \
             0x8000  ha-mqtt/.pio/build/esp32/partitions.bin \
             0xe000  "$BOOT_APP" \
             0x10000 ha-mqtt/.pio/build/esp32/firmware.bin
 
+      - name: Package HA Edition — ESP32-S3 (merge to flashable .bin)
+        run: |
+          BOOT_APP=$(find ~/.platformio -path "*/esp32s3/*" -name boot_app0.bin | head -1)
+          python -m esptool --chip esp32s3 merge_bin \
+            --output "$HA_S3_BIN" \
+            --flash_mode dio --flash_freq 80m --flash_size 4MB \
+            0x0     ha-mqtt/.pio/build/esp32s3/bootloader.bin \
+            0x8000  ha-mqtt/.pio/build/esp32s3/partitions.bin \
+            0xe000  "$BOOT_APP" \
+            0x10000 ha-mqtt/.pio/build/esp32s3/firmware.bin
+
       - name: Package Basic Edition (merge to flashable .bin)
         run: |
-          BOOT_APP=$(find ~/.platformio -name boot_app0.bin | head -1)
+          BOOT_APP=$(find ~/.platformio -path "*/esp32/*" -name boot_app0.bin | head -1)
           python -m esptool --chip esp32 merge_bin \
             --output "$BASIC_BIN" \
             --flash_mode dio --flash_freq 40m --flash_size 4MB \
@@ -88,21 +100,28 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ env.HA_BIN }}
+            ${{ env.HA_ESP32_BIN }}
+            ${{ env.HA_S3_BIN }}
             ${{ env.BASIC_BIN }}
           body: |
-            ## Two versions — pick the one that fits your setup
+            ## Pick the firmware that fits your setup
 
-            | File | Version | Use this if… |
-            |------|---------|--------------|
-            | `${{ env.HA_BIN }}` | v${{ env.HA_VER }} | You use **Home Assistant / MQTT** |
-            | `${{ env.BASIC_BIN }}` | v${{ env.BASIC_VER }} | You just want a **plug-and-play BLE bridge** |
+            ### Home Assistant / MQTT Edition (v${{ env.HA_VER }})
+            | File | Chip |
+            |------|------|
+            | `${{ env.HA_ESP32_BIN }}` | **ESP32** (WROOM-32, DevKitC) |
+            | `${{ env.HA_S3_BIN }}` | **ESP32-S3** (S3-DevKitC, S3-WROOM) |
+
+            ### Basic BLE Bridge (v${{ env.BASIC_VER }})
+            | File | Chip |
+            |------|------|
+            | `${{ env.BASIC_BIN }}` | **ESP32** (WROOM-32, DevKitC) |
 
             ## How to Flash
 
-            1. Download the `.bin` you want from the Assets section below
+            1. Download the `.bin` for your board from the Assets below
             2. Open **[web.esphome.io](https://web.esphome.io)** in Chrome or Edge
             3. Click **Install** → **Browse** → select the `.bin` → select your COM port → Flash
 
-            > **Upgrading from pre-v2.0.3 or from the Basic firmware?**  
+            > **Upgrading from pre-v2.0.3 or from the Basic firmware?**
             > The HA edition uses a new dual-OTA partition table — flash via USB once, then all future updates can be done wirelessly from the device's web UI (`http://<device-ip>/update`).
