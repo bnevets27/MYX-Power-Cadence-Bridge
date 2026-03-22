@@ -142,7 +142,5 @@ jobs:
 
             1. Download the `.bin` for your board from the Assets below
             2. Open **[web.esphome.io](https://web.esphome.io)** in Chrome or Edge
-            3. Click **Install** → **Browse** → select the `.bin` → select your COM port → Flash
-
-            > **Upgrading from pre-v2.0.3 or from the Basic firmware?**
-            > The HA edition uses a new dual-OTA partition table — flash via USB once, then all future updates can be done wirelessly from the device's web UI (`http://<device-ip>/update`).
+            3. Plug in you esp32 and ensure it's in bootloader mode
+            4. Click **Install** → **Browse** → select the `.bin` → select your COM port → Flash
