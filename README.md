@@ -51,11 +51,9 @@ Any board built on the **original ESP32 chip** (dual-core Xtensa, with both Wi-F
 
 No soldering or extra components required.
 
-> **Compatibility note:** The HA edition needs Wi-Fi **and** BLE running simultaneously, which requires the classic ESP32. Newer variants will **not** work out of the box:
+> **Compatibility note:** 
 > - **ESP32-S2** — no BLE, incompatible
 > - **ESP32-C3 / C6** — not currently supported
->
-> If the listing says "ESP32-WROOM-32" or "ESP32-DevKitC" you're good. If unsure, check that the chip is labelled **ESP32-D0WD** or **ESP32-D0WDQ6** — those are the classic dual-core modules.
 >
 > Minimum flash: **4MB** (standard on virtually all ESP32 dev boards).
 
