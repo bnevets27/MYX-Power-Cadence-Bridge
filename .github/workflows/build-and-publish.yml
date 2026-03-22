@@ -90,17 +90,26 @@ jobs:
             0xe000  "$BOOT_APP" \
             0x10000 ha-mqtt/.pio/build/esp32s3/firmware.bin
 
-      - name: Package Basic Edition — ESP32-S3 (merge to flashable .bin)
+      - name: Package Basic Edition — ESP32 (merge to flashable .bin)
         run: |
           BOOT_APP="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
           echo "boot_app0.bin: $BOOT_APP"
-          python -m esptool --chip esp32s3 merge-bin \
-            --output "$BASIC_BIN" \
-            --flash-mode dio --flash-freq 80m --flash-size 4MB \
-            0x0     basic/.pio/build/esp32s3/bootloader.bin \
-            0x8000  basic/.pio/build/esp32s3/partitions.bin \
-            0xe000  "$BOOT_APP" \
-            0x10000 basic/.pio/build/esp32s3/firmware.bin          
+          if [ -n "$BOOT_APP" ]; then
+            python -m esptool --chip esp32 merge-bin \
+              --output "$BASIC_BIN" \
+              --flash-mode dio --flash-freq 40m --flash-size 4MB \
+              0x1000  basic/.pio/build/esp32/bootloader.bin \
+              0x8000  basic/.pio/build/esp32/partitions.bin \
+              0xe000  "$BOOT_APP" \
+              0x10000 basic/.pio/build/esp32/firmware.bin
+          else
+            python -m esptool --chip esp32 merge-bin \
+              --output "$BASIC_BIN" \
+              --flash-mode dio --flash-freq 40m --flash-size 4MB \
+              0x1000  basic/.pio/build/esp32/bootloader.bin \
+              0x8000  basic/.pio/build/esp32/partitions.bin \
+              0x10000 basic/.pio/build/esp32/firmware.bin
+          fi
 
       - name: Package Basic Edition — ESP32-S3 (merge to flashable .bin)
         run: |
