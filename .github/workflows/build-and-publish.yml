@@ -91,13 +91,22 @@ jobs:
         run: |
           BOOT_APP=$(find ~/.platformio -name boot_app0.bin -path "*/esp32/*" | head -1)
           echo "boot_app0.bin: $BOOT_APP"
-          python -m esptool --chip esp32 merge-bin \
-            --output "$BASIC_BIN" \
-            --flash-mode dio --flash-freq 40m --flash-size 4MB \
-            0x1000  basic/.pio/build/esp32/bootloader.bin \
-            0x8000  basic/.pio/build/esp32/partitions.bin \
-            0xe000  "$BOOT_APP" \
-            0x10000 basic/.pio/build/esp32/firmware.bin
+          if [ -n "$BOOT_APP" ]; then
+            python -m esptool --chip esp32 merge-bin \
+              --output "$BASIC_BIN" \
+              --flash-mode dio --flash-freq 40m --flash-size 4MB \
+              0x1000  basic/.pio/build/esp32/bootloader.bin \
+              0x8000  basic/.pio/build/esp32/partitions.bin \
+              0xe000  "$BOOT_APP" \
+              0x10000 basic/.pio/build/esp32/firmware.bin
+          else
+            python -m esptool --chip esp32 merge-bin \
+              --output "$BASIC_BIN" \
+              --flash-mode dio --flash-freq 40m --flash-size 4MB \
+              0x1000  basic/.pio/build/esp32/bootloader.bin \
+              0x8000  basic/.pio/build/esp32/partitions.bin \
+              0x10000 basic/.pio/build/esp32/firmware.bin
+          fi
 
       - name: Package Basic Edition — ESP32-S3 (merge to flashable .bin)
         run: |
