@@ -64,10 +64,11 @@ jobs:
 
       - name: Package HA Edition — ESP32 (merge to flashable .bin)
         run: |
-          BOOT_APP=$(find ~/.platformio -path "*/esp32/*" -name boot_app0.bin | head -1)
-          python -m esptool --chip esp32 merge_bin \
+          BOOT_APP=$(find ~/.platformio -name boot_app0.bin -path "*/esp32/*" | head -1)
+          echo "boot_app0.bin: $BOOT_APP"
+          python -m esptool --chip esp32 merge-bin \
             --output "$HA_ESP32_BIN" \
-            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            --flash-mode dio --flash-freq 40m --flash-size 4MB \
             0x1000  ha-mqtt/.pio/build/esp32/bootloader.bin \
             0x8000  ha-mqtt/.pio/build/esp32/partitions.bin \
             0xe000  "$BOOT_APP" \
@@ -75,10 +76,11 @@ jobs:
 
       - name: Package HA Edition — ESP32-S3 (merge to flashable .bin)
         run: |
-          BOOT_APP=$(find ~/.platformio -path "*/esp32s3/*" -name boot_app0.bin | head -1)
-          python -m esptool --chip esp32s3 merge_bin \
+          BOOT_APP=$(find ~/.platformio -name boot_app0.bin -path "*/esp32s3/*" | head -1)
+          echo "boot_app0.bin: $BOOT_APP"
+          python -m esptool --chip esp32s3 merge-bin \
             --output "$HA_S3_BIN" \
-            --flash_mode dio --flash_freq 80m --flash_size 4MB \
+            --flash-mode dio --flash-freq 80m --flash-size 4MB \
             0x0     ha-mqtt/.pio/build/esp32s3/bootloader.bin \
             0x8000  ha-mqtt/.pio/build/esp32s3/partitions.bin \
             0xe000  "$BOOT_APP" \
@@ -86,10 +88,11 @@ jobs:
 
       - name: Package Basic Edition (merge to flashable .bin)
         run: |
-          BOOT_APP=$(find ~/.platformio -path "*/esp32/*" -name boot_app0.bin | head -1)
-          python -m esptool --chip esp32 merge_bin \
+          BOOT_APP=$(find ~/.platformio -name boot_app0.bin -path "*/esp32/*" | head -1)
+          echo "boot_app0.bin: $BOOT_APP"
+          python -m esptool --chip esp32 merge-bin \
             --output "$BASIC_BIN" \
-            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            --flash-mode dio --flash-freq 40m --flash-size 4MB \
             0x1000  basic/.pio/build/esp32/bootloader.bin \
             0x8000  basic/.pio/build/esp32/partitions.bin \
             0xe000  "$BOOT_APP" \
