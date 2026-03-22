@@ -11,6 +11,9 @@ on:
 
 jobs:
   build-and-release:
+    concurrency:
+      group: build-${{ github.sha }}
+      cancel-in-progress: true
     name: Build Firmware
     runs-on: ubuntu-latest
     permissions:
