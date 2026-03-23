@@ -46,7 +46,7 @@ The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unr
 
 Any board built on the **original ESP32 chip** (dual-core Xtensa, with both Wi-Fi and BLE) works. Recommended:
 
-- **ESP32-DevKitC** or **ESP32-WROOM-32** or **ESP32-S3**
+- **ESP32-DevKitC** or **ESP32-WROOM-32**
 - USB-C or Micro USB data cable for the initial flash, then any USB power source
 
 No soldering or extra components required.
