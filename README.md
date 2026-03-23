@@ -55,7 +55,7 @@ No soldering or extra components required.
 > - **ESP32-S3** - Supported but usually has 4MB flash so no OTA support
 > 
 > [Not supported]
-> - **ESP32-S2** — no BLE, incompatible
+> - **ESP32-S2** — incompatible, no BLE
 > - **ESP32-C3 / C6** — not currently supported
 >
 > Minimum flash: **4MB** (standard on virtually all ESP32 dev boards). **8MB** for OTA support.
