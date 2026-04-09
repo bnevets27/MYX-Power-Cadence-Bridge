@@ -45,7 +45,7 @@ static const uint8_t XOR_KEY = 0xAA;
 static const char* BRIDGE_NAME = "MYX Bridge";
 
 // Firmware version
-static const char* FW_VERSION = "1.0.2";
+static const char* FW_VERSION = "1.0.3";
 
 // ─── Power Smoothing ─────────────────────────────────────────────────────────
 //
@@ -73,6 +73,85 @@ static const float SMOOTHING_FACTOR = 0.5f;
 // sending packets at rest.
 
 static const uint32_t DROPOUT_MS = 2500;
+
+// ─── Power Offset Correction ─────────────────────────────────────────────────
+//
+// Some spin bikes report inflated or deflated power values due to sensor
+// calibration assumptions that don't match the bike's drivetrain. This
+// framework lets you correct for a known cadence-dependent offset.
+//
+// Set ENABLE_OFFSET_CORRECTION to true and populate the calibration table
+// below with values measured on your specific bike. The correction is
+// disabled by default and the table is zeroed — no behaviour changes unless
+// you explicitly enable it.
+//
+// ── How to calibrate ──
+// 1. Set flywheel resistance to zero.
+// 2. Hold each target cadence steady for ~60 seconds.
+// 3. Note the average reported watts — this is your offset at that cadence.
+// 4. Enter the values in OFFSET_WATTS below.
+// 5. Set ENABLE_OFFSET_CORRECTION to true.
+//
+// Offsets can be positive (sensor reads too high) or negative (sensor reads
+// too low). The correction is applied before smoothing.
+//
+// CORRECTION_FACTOR controls how much of the offset is applied:
+//   0.0 = no correction
+//   0.5 = half correction
+//   1.0 = full correction
+//
+// Start at 1.0 for maximum accuracy. If corrected power feels too low during
+// easy riding, try 0.5 as a compromise.
+//
+// ── Example: Bodi MYX II (positive offset — sensor reads too high) ──
+// Measured at zero resistance, ~60 seconds per cadence:
+//
+//   static const float OFFSET_CADENCE[] = { 60.0f,  70.0f,  80.0f,  90.0f };
+//   static const float OFFSET_WATTS[]   = { 87.0f,  97.0f, 106.0f, 112.0f };
+//
+// ── Example: hypothetical bike with negative offset (sensor reads too low) ──
+//
+//   static const float OFFSET_CADENCE[] = { 60.0f,  70.0f,  80.0f,  90.0f };
+//   static const float OFFSET_WATTS[]   = { -20.0f, -22.0f, -25.0f, -28.0f };
+
+static const bool  ENABLE_OFFSET_CORRECTION = false;
+static const float CORRECTION_FACTOR        = 1.0f;
+
+static const int   OFFSET_TABLE_SIZE = 4;
+static const float OFFSET_CADENCE[]  = { 60.0f,  70.0f,  80.0f,  90.0f };
+static const float OFFSET_WATTS[]    = {  0.0f,   0.0f,   0.0f,   0.0f };
+
+/**
+ * Returns the interpolated power offset for a given cadence.
+ * - Below the lowest cadence point: returns the lowest offset value
+ * - Above the highest cadence point: linearly extrapolates
+ * - Between points: linearly interpolates
+ */
+float getOffsetForCadence(float cadence) {
+    if (cadence <= 0.0f) return 0.0f;
+
+    // Below table minimum — return lowest offset
+    if (cadence <= OFFSET_CADENCE[0]) return OFFSET_WATTS[0];
+
+    // Above table maximum — extrapolate from last two points
+    if (cadence >= OFFSET_CADENCE[OFFSET_TABLE_SIZE - 1]) {
+        float slope = (OFFSET_WATTS[OFFSET_TABLE_SIZE - 1] - OFFSET_WATTS[OFFSET_TABLE_SIZE - 2])
+                    / (OFFSET_CADENCE[OFFSET_TABLE_SIZE - 1] - OFFSET_CADENCE[OFFSET_TABLE_SIZE - 2]);
+        return OFFSET_WATTS[OFFSET_TABLE_SIZE - 1]
+             + slope * (cadence - OFFSET_CADENCE[OFFSET_TABLE_SIZE - 1]);
+    }
+
+    // Linear interpolation between surrounding points
+    for (int i = 0; i < OFFSET_TABLE_SIZE - 1; i++) {
+        if (cadence >= OFFSET_CADENCE[i] && cadence <= OFFSET_CADENCE[i + 1]) {
+            float t = (cadence - OFFSET_CADENCE[i])
+                    / (OFFSET_CADENCE[i + 1] - OFFSET_CADENCE[i]);
+            return OFFSET_WATTS[i] + t * (OFFSET_WATTS[i + 1] - OFFSET_WATTS[i]);
+        }
+    }
+
+    return 0.0f;  // Fallback — should never reach here
+}
 
 // ─── BLE UUIDs ──────────────────────────────────────────────────────────────
 
@@ -133,7 +212,7 @@ static float    smoothedPower   = 0.0f;
 
 // Timestamp of the last crank revolution increment. Updated ONLY when cRev
 // changes, not on every packet arrival — otherwise the dropout timer would
-// never fire while the flywheel is coasting.
+// never fire while the sensor keeps sending packets at rest.
 static uint32_t lastCrankMoveMs = 0;
 
 // LED feedback
@@ -265,7 +344,7 @@ static void notifyCallback(
 
     // ── Dropout watchdog ──
     // Update the crank movement timestamp ONLY when cRev actually changes.
-    // If we updated on every packet the timer would never fire while coasting.
+    // If we updated on every packet the timer would never fire at rest.
     if (cRev != prevCrankRev) {
         lastCrankMoveMs = millis();
     }
@@ -280,15 +359,6 @@ static void notifyCallback(
         lastCadence   = 0.0f;
         lastPower     = 0;
     } else {
-        // Clamp negative power to zero
-        if (power < 0) power = 0;
-
-        // Store for display
-        lastPower     = power;
-        lastCrankRev  = cRev;
-        lastCrankTime = cTime;
-        lastEnergy    = energy;
-
         // Calculate cadence
         float cadence = calcCadence(cRev, cTime, prevCrankRev, prevCrankTime);
         if (cadence > 0.0f && cadence < 200.0f) {
@@ -299,11 +369,45 @@ static void notifyCallback(
             lastCadence = 0.0f;  // No movement
         }
 
+        // ── Apply cadence-indexed offset correction ──
+        // Subtracts a fraction (CORRECTION_FACTOR) of the measured offset.
+        // Only applied when correction is enabled and cadence is active.
+        // Applied before smoothing so the smoother works on corrected values.
+        int16_t rawPower = power;
+        if (ENABLE_OFFSET_CORRECTION && lastCadence > 0.0f) {
+            float offset = getOffsetForCadence(lastCadence) * CORRECTION_FACTOR;
+            power = (int16_t)(power - (int16_t)offset);
+        }
+
+        // Clamp corrected power to zero minimum
+        if (power < 0) power = 0;
+
+        // Store for display
+        lastPower     = power;
+        lastCrankRev  = cRev;
+        lastCrankTime = cTime;
+        lastEnergy    = energy;
+
         // ── Exponential moving average smoothing ──
-        // Reduces packet-to-packet power jumpiness without significantly
-        // slowing response to real efforts. Adjust SMOOTHING_FACTOR to taste.
         smoothedPower = (power * SMOOTHING_FACTOR) + (smoothedPower * (1.0f - SMOOTHING_FACTOR));
         power = (int16_t)smoothedPower;
+
+        // Serial debug output (throttled to unique changes)
+        static int16_t prevPrintPower = -999;
+        static uint16_t prevPrintRev = 0xFFFF;
+        if (power != prevPrintPower || cRev != prevPrintRev) {
+            if (ENABLE_OFFSET_CORRECTION && lastCadence > 0.0f) {
+                Serial.printf("[DATA] Power: %4d W (raw: %4d W, offset: %4.0f W, factor: %.1f) | Cadence: %5.1f RPM | CrankRev: %5u | Energy: %5u kJ\n",
+                              power, rawPower,
+                              getOffsetForCadence(lastCadence) * CORRECTION_FACTOR,
+                              CORRECTION_FACTOR, lastCadence, cRev, energy);
+            } else {
+                Serial.printf("[DATA] Power: %4d W | Cadence: %5.1f RPM | CrankRev: %5u | Energy: %5u kJ\n",
+                              power, lastCadence, cRev, energy);
+            }
+            prevPrintPower = power;
+            prevPrintRev   = cRev;
+        }
     }
 
     prevCrankRev  = cRev;
@@ -357,18 +461,8 @@ static void notifyCallback(
         cscMeasurementChar->notify();
     }
 
-    // Serial debug output (throttled to unique changes)
-    static int16_t prevPrintPower = -999;
-    static uint16_t prevPrintRev = 0xFFFF;
-    if (power != prevPrintPower || cRev != prevPrintRev) {
-        if (dropped) {
-            Serial.println("[DATA] Dropout — power and cadence zeroed.");
-        } else {
-            Serial.printf("[DATA] Power: %4d W | Cadence: %5.1f RPM | CrankRev: %5u | Energy: %5u kJ\n",
-                          power, lastCadence, cRev, energy);
-        }
-        prevPrintPower = power;
-        prevPrintRev = cRev;
+    if (dropped) {
+        Serial.println("[DATA] Dropout — power and cadence zeroed.");
     }
 }
 
@@ -567,38 +661,31 @@ void setupBLEServer() {
     cpsService->start();
 
     // ── Cycling Speed & Cadence Service (0x1816) ──
-    // Apps like Peloton, Zwift, Wahoo, etc. often read cadence from CSC
-    // rather than from the crank data embedded in CPS measurements.
     BLEService* cscService = bleServer->createService(CSC_SERVICE_UUID, 12);
 
-    // CSC Measurement (0x2A5B) — Notify
     cscMeasurementChar = cscService->createCharacteristic(
         CSC_MEASUREMENT_UUID,
         BLECharacteristic::PROPERTY_NOTIFY
     );
     cscMeasurementChar->addDescriptor(new BLE2902());
 
-    // CSC Feature (0x2A5C) — Read
-    // Bit 1 = Crank Revolution Data Supported → 0x02
     BLECharacteristic* cscFeatureChar = cscService->createCharacteristic(
         CSC_FEATURE_UUID,
         BLECharacteristic::PROPERTY_READ
     );
-    uint8_t cscFeature[2] = {0x02, 0x00};  // Crank Revolution Data Supported
+    uint8_t cscFeature[2] = {0x02, 0x00};
     cscFeatureChar->setValue(cscFeature, 2);
 
-    // CSC also uses Sensor Location — reuse the same value
     BLECharacteristic* cscSensorLoc = cscService->createCharacteristic(
         SENSOR_LOCATION_UUID,
         BLECharacteristic::PROPERTY_READ
     );
-    uint8_t cscLoc = 0x05;  // Left Crank
+    uint8_t cscLoc = 0x05;
     cscSensorLoc->setValue(&cscLoc, 1);
 
     cscService->start();
 
     // ── Device Information Service (0x180A) ──
-    // Helps apps identify this device and improves compatibility.
     BLEService* disService = bleServer->createService(BLEUUID((uint16_t)0x180A));
     BLECharacteristic* mfgNameChar = disService->createCharacteristic(
         BLEUUID((uint16_t)0x2A29), BLECharacteristic::PROPERTY_READ);
@@ -612,7 +699,6 @@ void setupBLEServer() {
     disService->start();
 
     // ── Battery Service (0x180F) ──
-    // Re-broadcasts the sensor's battery level so apps can show it.
     BLEService* battService = bleServer->createService(BATTERY_SERVICE_UUID, 8);
     batteryLevelChar = battService->createCharacteristic(
         BATTERY_LEVEL_UUID,
@@ -628,15 +714,26 @@ void setupBLEServer() {
     pAdvertising->addServiceUUID(CPS_SERVICE_UUID);
     pAdvertising->addServiceUUID(CSC_SERVICE_UUID);
     pAdvertising->addServiceUUID(BATTERY_SERVICE_UUID);
-    pAdvertising->setAppearance(0x0484);   // Cycling Power Sensor
+    pAdvertising->setAppearance(0x0484);
     pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);   // Connection interval min (7.5 ms)
-    pAdvertising->setMaxPreferred(0x12);   // Connection interval max (22.5 ms)
+    pAdvertising->setMinPreferred(0x06);
+    pAdvertising->setMaxPreferred(0x12);
     BLEDevice::startAdvertising();
 
     Serial.printf("[SERVER] Advertising as '%s' with Cycling Power Service\n", BRIDGE_NAME);
     Serial.printf("[SERVER] Smoothing factor: %.1f | Dropout timeout: %d ms\n",
                   SMOOTHING_FACTOR, DROPOUT_MS);
+    if (ENABLE_OFFSET_CORRECTION) {
+        Serial.printf("[OFFSET] Correction ENABLED | Factor: %.1f\n", CORRECTION_FACTOR);
+        Serial.println("[OFFSET] Calibration table:");
+        for (int i = 0; i < OFFSET_TABLE_SIZE; i++) {
+            Serial.printf("[OFFSET]   %.0f rpm → %.0f W (%.0f W applied)\n",
+                          OFFSET_CADENCE[i], OFFSET_WATTS[i],
+                          OFFSET_WATTS[i] * CORRECTION_FACTOR);
+        }
+    } else {
+        Serial.println("[OFFSET] Correction DISABLED — broadcasting raw sensor values");
+    }
 }
 
 // ─── Arduino Setup ──────────────────────────────────────────────────────────
@@ -706,20 +803,17 @@ void loop() {
     // ── LED status feedback ──
     unsigned long now = millis();
     if (sensorConnected && appConnectionCount > 0) {
-        // Solid LED = sensor connected AND app connected (full bridge active)
         if (!ledState) {
             digitalWrite(LED_PIN, HIGH);
             ledState = true;
         }
     } else if (sensorConnected) {
-        // Fast blink = sensor connected, waiting for app
         if (now - lastBlinkTime > 250) {
             ledState = !ledState;
             digitalWrite(LED_PIN, ledState ? HIGH : LOW);
             lastBlinkTime = now;
         }
     } else {
-        // Slow blink = searching for sensor
         if (now - lastBlinkTime > 1000) {
             ledState = !ledState;
             digitalWrite(LED_PIN, ledState ? HIGH : LOW);
