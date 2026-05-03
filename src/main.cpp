@@ -45,7 +45,34 @@ static const uint8_t XOR_KEY = 0xAA;
 static const char* BRIDGE_NAME = "MYX Bridge";
 
 // Firmware version
-static const char* FW_VERSION = "1.0.1";
+static const char* FW_VERSION = "1.0.2";
+
+// ─── Power Smoothing ─────────────────────────────────────────────────────────
+//
+// Exponential moving average applied to power before broadcasting.
+// Formula: smoothed = (raw * factor) + (smoothed * (1 - factor))
+//
+//   0.0 = maximum smoothing (output never changes — not useful)
+//   0.5 = moderate smoothing (good balance of stability and responsiveness)
+//   1.0 = no smoothing (raw values passed through unchanged)
+//
+// Lower values produce a smoother but slower-to-respond output.
+// Higher values produce a more responsive but jumpier output.
+// 0.5 is a recommended starting point.
+
+static const float SMOOTHING_FACTOR = 0.5f;
+
+// ─── Pedaling Dropout ────────────────────────────────────────────────────────
+//
+// If no new crank revolutions are detected within this window, power and
+// cadence are immediately forced to zero and broadcast. This prevents the
+// bridge from reporting stale non-zero power after you stop pedaling.
+//
+// The timer is only reset when cRev actually increments — not on every
+// BLE packet — so the timer fires correctly even though the sensor keeps
+// sending packets at rest.
+
+static const uint32_t DROPOUT_MS = 2500;
 
 // ─── BLE UUIDs ──────────────────────────────────────────────────────────────
 
@@ -97,6 +124,17 @@ static volatile uint16_t lastEnergy = 0;
 static uint16_t prevCrankRev = 0;
 static uint16_t prevCrankTime = 0;
 static float    lastCadence = 0.0f;
+
+// ─── Smoothing + Dropout State ───────────────────────────────────────────────
+
+// EMA accumulator — zeroed immediately on dropout so stale values from a
+// previous effort don't bleed into the next one.
+static float    smoothedPower   = 0.0f;
+
+// Timestamp of the last crank revolution increment. Updated ONLY when cRev
+// changes, not on every packet arrival — otherwise the dropout timer would
+// never fire while the flywheel is coasting.
+static uint32_t lastCrankMoveMs = 0;
 
 // LED feedback
 #ifndef LED_PIN
@@ -225,24 +263,49 @@ static void notifyCallback(
     uint16_t cTime  = (uint16_t)(decoded[6] | (decoded[7] << 8));
     uint16_t energy = (uint16_t)(decoded[8] | (decoded[9] << 8));
 
-    // Clamp negative power to zero (shouldn't happen normally)
-    if (power < 0) power = 0;
-
-    // Store for display
-    lastPower    = power;
-    lastCrankRev = cRev;
-    lastCrankTime = cTime;
-    lastEnergy   = energy;
-
-    // Calculate cadence
-    float cadence = calcCadence(cRev, cTime, prevCrankRev, prevCrankTime);
-    if (cadence > 0.0f && cadence < 200.0f) {
-        lastCadence = cadence;
-    } else if (cRev != prevCrankRev) {
-        // Crank moved but cadence is out of range — keep last known
-    } else {
-        lastCadence = 0.0f;  // No movement
+    // ── Dropout watchdog ──
+    // Update the crank movement timestamp ONLY when cRev actually changes.
+    // If we updated on every packet the timer would never fire while coasting.
+    if (cRev != prevCrankRev) {
+        lastCrankMoveMs = millis();
     }
+
+    bool dropped = (millis() - lastCrankMoveMs > DROPOUT_MS);
+
+    if (dropped) {
+        // Immediate reset — zero everything and broadcast.
+        // Zeroing smoothedPower prevents stale values bleeding into the next effort.
+        power         = 0;
+        smoothedPower = 0.0f;
+        lastCadence   = 0.0f;
+        lastPower     = 0;
+    } else {
+        // Clamp negative power to zero
+        if (power < 0) power = 0;
+
+        // Store for display
+        lastPower     = power;
+        lastCrankRev  = cRev;
+        lastCrankTime = cTime;
+        lastEnergy    = energy;
+
+        // Calculate cadence
+        float cadence = calcCadence(cRev, cTime, prevCrankRev, prevCrankTime);
+        if (cadence > 0.0f && cadence < 200.0f) {
+            lastCadence = cadence;
+        } else if (cRev != prevCrankRev) {
+            // Crank moved but cadence is out of range — keep last known
+        } else {
+            lastCadence = 0.0f;  // No movement
+        }
+
+        // ── Exponential moving average smoothing ──
+        // Reduces packet-to-packet power jumpiness without significantly
+        // slowing response to real efforts. Adjust SMOOTHING_FACTOR to taste.
+        smoothedPower = (power * SMOOTHING_FACTOR) + (smoothedPower * (1.0f - SMOOTHING_FACTOR));
+        power = (int16_t)smoothedPower;
+    }
+
     prevCrankRev  = cRev;
     prevCrankTime = cTime;
 
@@ -298,8 +361,12 @@ static void notifyCallback(
     static int16_t prevPrintPower = -999;
     static uint16_t prevPrintRev = 0xFFFF;
     if (power != prevPrintPower || cRev != prevPrintRev) {
-        Serial.printf("[DATA] Power: %4d W | Cadence: %5.1f RPM | CrankRev: %5u | Energy: %5u kJ\n",
-                      power, lastCadence, cRev, energy);
+        if (dropped) {
+            Serial.println("[DATA] Dropout — power and cadence zeroed.");
+        } else {
+            Serial.printf("[DATA] Power: %4d W | Cadence: %5.1f RPM | CrankRev: %5u | Energy: %5u kJ\n",
+                          power, lastCadence, cRev, energy);
+        }
         prevPrintPower = power;
         prevPrintRev = cRev;
     }
@@ -440,6 +507,9 @@ bool connectToSensor() {
         Serial.println("[SENSOR] Battery Service (0x180F) not found");
     }
 
+    // Initialize dropout timer now that we're connected
+    lastCrankMoveMs = millis();
+
     sensorConnected = true;
     return true;
 }
@@ -538,7 +608,7 @@ void setupBLEServer() {
     modelChar->setValue("BikePower Bridge v1");
     BLECharacteristic* fwRevChar = disService->createCharacteristic(
         BLEUUID((uint16_t)0x2A26), BLECharacteristic::PROPERTY_READ);
-    fwRevChar->setValue("1.0.1");
+    fwRevChar->setValue(FW_VERSION);
     disService->start();
 
     // ── Battery Service (0x180F) ──
@@ -565,6 +635,8 @@ void setupBLEServer() {
     BLEDevice::startAdvertising();
 
     Serial.printf("[SERVER] Advertising as '%s' with Cycling Power Service\n", BRIDGE_NAME);
+    Serial.printf("[SERVER] Smoothing factor: %.1f | Dropout timeout: %d ms\n",
+                  SMOOTHING_FACTOR, DROPOUT_MS);
 }
 
 // ─── Arduino Setup ──────────────────────────────────────────────────────────
@@ -576,6 +648,7 @@ void setup() {
     Serial.println();
     Serial.println("=========================================");
     Serial.println("  ESP32 BLE Bike Power Meter Bridge");
+    Serial.printf ("  Firmware: %s\n", FW_VERSION);
     Serial.println("=========================================");
     Serial.println();
     Serial.println("This device connects to your MYX/BKSNSR");
@@ -587,6 +660,9 @@ void setup() {
     // LED setup
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
+
+    // Safe initial value for dropout timer
+    lastCrankMoveMs = millis();
 
     // Initialize BLE with enough memory for both client and server roles
     BLEDevice::init(BRIDGE_NAME);
