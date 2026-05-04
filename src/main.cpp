@@ -90,6 +90,8 @@ static bool sensorConnected = false;
 static bool remoteControlPointReady = false;
 static bool doConnect = false;
 static bool doScan = true;
+static bool scanRunning = false;
+static bool calPortalStarted = false; // forward-declared so callbacks can reach it
 
 // BLE server state: what apps connect to.
 static BLEServer* bleServer = nullptr;
@@ -499,29 +501,60 @@ class SensorClientCallbacks : public BLEClientCallbacks {
         remoteControlPointReady = false;
         remotePowerControlPoint = nullptr;
         doScan = true;
+
+        // Shut down the WiFi AP so BLE scanning runs without radio
+        // contention. The AP will be restarted in loop() once the
+        // sensor reconnects (calPortalStarted is reset below).
+        if (calPortalStarted) {
+            webServer.stop();
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_OFF);
+            Serial.println("[WEB] Calibration AP stopped for clean BLE rescan");
+            calPortalStarted = false;
+        }
     }
 };
 
 class SensorScanCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) override {
-        if (advertisedDevice.haveServiceUUID() &&
-            advertisedDevice.isAdvertisingService(CPS_SERVICE_UUID)) {
-            String devName = advertisedDevice.getName().c_str();
-            if (strlen(TARGET_SENSOR_NAME) > 0 && !devName.startsWith(TARGET_SENSOR_NAME)) {
-                Serial.printf("[SCAN] Found CPS device '%s' but name does not match filter '%s'\n",
-                              devName.c_str(), TARGET_SENSOR_NAME);
-                return;
-            }
+        // Match by service UUID (preferred) or by device name as a fallback.
+        // When WiFi AP is active it competes for radio time and BLE active-scan
+        // responses — which carry the service UUID — can be missed.  Matching by
+        // name alone lets us find the sensor even in that situation.
+        bool hasCPS = advertisedDevice.haveServiceUUID() &&
+                  advertisedDevice.isAdvertisingService(CPS_SERVICE_UUID);
+        String devName = advertisedDevice.getName().c_str();
+        bool hasName = advertisedDevice.haveName() && devName.length() > 0;
+        bool nameMatch = strlen(TARGET_SENSOR_NAME) > 0 && devName.startsWith(TARGET_SENSOR_NAME);
 
-            Serial.printf("[SCAN] Found target sensor: %s (%s)\n",
-                          advertisedDevice.getName().c_str(),
-                          advertisedDevice.getAddress().toString().c_str());
-
-            BLEDevice::getScan()->stop();
-            sensorDevice = new BLEAdvertisedDevice(advertisedDevice);
-            doConnect = true;
-            doScan = false;
+        if (hasCPS || nameMatch || advertisedDevice.haveName()) {
+            Serial.printf("[SCANDBG] Name:'%s' Addr:%s CPS:%s\n",
+                          devName.c_str(),
+                          advertisedDevice.getAddress().toString().c_str(),
+                          hasCPS ? "yes" : "no");
         }
+
+        if (!hasCPS && !nameMatch) return;  // Not our sensor
+
+        // If CPS is present, allow unnamed devices (some advertisements do not
+        // include Complete Local Name). Only enforce prefix filter when a name
+        // is actually present.
+        if (hasCPS && strlen(TARGET_SENSOR_NAME) > 0 && hasName && !nameMatch) {
+            Serial.printf("[SCAN] Found CPS device '%s' but name does not match filter '%s'\n",
+                          devName.c_str(), TARGET_SENSOR_NAME);
+            return;
+        }
+
+        Serial.printf("[SCAN] Found target sensor: %s (%s)%s\n",
+                      advertisedDevice.getName().c_str(),
+                      advertisedDevice.getAddress().toString().c_str(),
+                      hasCPS ? "" : " [matched by name, CPS UUID not in adv]");
+
+        BLEDevice::getScan()->stop();
+        scanRunning = false;
+        sensorDevice = new BLEAdvertisedDevice(advertisedDevice);
+        doConnect = true;
+        doScan = false;
     }
 };
 
@@ -529,6 +562,11 @@ static bool connectToSensor() {
     if (sensorDevice == nullptr) return false;
 
     Serial.printf("[SENSOR] Connecting to %s ...\n", sensorDevice->getAddress().toString().c_str());
+
+    if (scanRunning) {
+        BLEDevice::getScan()->stop();
+        scanRunning = false;
+    }
 
     bleClient = BLEDevice::createClient();
     bleClient->setClientCallbacks(new SensorClientCallbacks());
@@ -944,20 +982,33 @@ void setup() {
 
     BLEDevice::init(BRIDGE_NAME);
     setupBLEServer();
-    setupCalibrationPortal();
+    // WiFi AP is started lazily in loop() once the sensor is connected.
+    // Starting the AP before scanning causes radio contention that prevents
+    // the ESP32 from receiving BLE scan response packets (which carry the
+    // sensor's service UUID and name).
 
-    Serial.println("[SCAN] Starting BLE scan for power meter...");
+    Serial.println("[SCAN] Starting continuous BLE scan for power meter...");
     BLEScan* pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new SensorScanCallbacks());
     pBLEScan->setInterval(1349);
     pBLEScan->setWindow(449);
     pBLEScan->setActiveScan(true);
-    pBLEScan->start(10, false);
-    Serial.println("[SCAN] Initial scan started");
+    pBLEScan->start(0, false);
+    scanRunning = true;
+    doScan = false;
+    Serial.println("[SCAN] Continuous scan running");
 }
 
 void loop() {
-    webServer.handleClient();
+    // Start the calibration AP the first time the sensor connects.
+    // This keeps the WiFi radio silent during BLE scanning so scan
+    // responses (service UUID + name) are not dropped.
+    if (sensorConnected && !calPortalStarted) {
+        setupCalibrationPortal();
+        calPortalStarted = true;
+    }
+
+    if (calPortalStarted) webServer.handleClient();
     serviceTuneState();
 
     if (doConnect) {
@@ -971,8 +1022,9 @@ void loop() {
     }
 
     if (!sensorConnected && doScan) {
-        Serial.println("[SCAN] Re-scanning for power meter...");
-        BLEDevice::getScan()->start(10, false);
+        Serial.println("[SCAN] Re-starting continuous scan for power meter...");
+        BLEDevice::getScan()->start(0, false);
+        scanRunning = true;
         doScan = false;
     }
 
