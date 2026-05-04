@@ -4,26 +4,12 @@
  *
  * Connects to a MYX/BKSNSR power meter sensor that XOR-masks its BLE
  * Cycling Power Measurement (0x2A63) data with 0xAA, decodes it, and
- * re-broadcasts as a standard-compliant BLE Cycling Power Service so
- * that apps like Zwift, TrainerRoad, Peloton, etc. can read it properly.
+ * re-broadcasts it as standard BLE Cycling Power + Cadence services.
  *
- * Sensor details (from LightBlue log analysis):
- *   Name pattern:  BKSNSR*
- *   Service:       0x1818 (Cycling Power)
- *   Measurement:   0x2A63 (Notify) - XOR 0xAA masked
- *   Feature:       0x2A65 (Read)   - value 0x80000000
- *   Sensor Loc:    0x2A5D (Read)   - value 0x04 (Front Wheel)
- *   Manufacturer:  MYX_Power_Meter
- *   Battery:       0x180F / 0x2A19 (Read+Notify) — plain uint8, 0-100%
- *
- * Decoded 10-byte payload (after XOR 0xAA):
- *   bytes 0-1:  flags                  uint16 LE  (always 0x0820)
- *   bytes 2-3:  instantaneous_power    sint16 LE  (watts)
- *   bytes 4-5:  cumulative_crank_rev   uint16 LE
- *   bytes 6-7:  last_crank_event_time  uint16 LE  (1/1024 s)
- *   bytes 8-9:  accumulated_energy     uint16 LE  (kJ)
- *
- * Hardware: Any ESP32 dev board (ESP32-DevKitC, ESP32-WROOM, etc.)
+ * This build also exposes a local calibration portal. The portal can attempt
+ * the OEM-style zero/tare procedure through the sensor's Cycling Power Control
+ * Point, then provides local correction as a fallback for sensors that cannot
+ * or will not tune themselves.
  */
 
 #include <Arduino.h>
@@ -31,202 +17,276 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
-// ─── Configuration ──────────────────────────────────────────────────────────
-
-// Set to empty string "" to connect to any device advertising Cycling Power Service.
-// Or set to your specific sensor name, e.g. "BSKNSRxxxxxxx"
-static const char* TARGET_SENSOR_NAME = "BKSNSR";  // Match any BKSNSR* device
-
-// The XOR key used by the sensor to mask data
-static const uint8_t XOR_KEY = 0xAA;
-
-// The name this ESP32 will advertise to apps (Zwift, etc.)
+// Configuration
+static const char* TARGET_SENSOR_NAME = "BKSNSR";
 static const char* BRIDGE_NAME = "MYX Bridge";
+static const char* CAL_AP_NAME = "MYX-Bridge-Calibrate";
+static const char* CAL_AP_PASS = "";
+static const char* FW_VERSION = "1.1.0-cal";
 
-// Firmware version
-static const char* FW_VERSION = "1.0.3";
-
-// ─── Power Smoothing ─────────────────────────────────────────────────────────
-//
-// Exponential moving average applied to power before broadcasting.
-// Formula: smoothed = (raw * factor) + (smoothed * (1 - factor))
-//
-//   0.0 = maximum smoothing (output never changes — not useful)
-//   0.5 = moderate smoothing (good balance of stability and responsiveness)
-//   1.0 = no smoothing (raw values passed through unchanged)
-//
-// Lower values produce a smoother but slower-to-respond output.
-// Higher values produce a more responsive but jumpier output.
-// 0.5 is a recommended starting point.
-
+static const uint8_t XOR_KEY = 0xAA;
 static const float SMOOTHING_FACTOR = 0.5f;
-
-// ─── Pedaling Dropout ────────────────────────────────────────────────────────
-//
-// If no new crank revolutions are detected within this window, power and
-// cadence are immediately forced to zero and broadcast. This prevents the
-// bridge from reporting stale non-zero power after you stop pedaling.
-//
-// The timer is only reset when cRev actually increments — not on every
-// BLE packet — so the timer fires correctly even though the sensor keeps
-// sending packets at rest.
-
 static const uint32_t DROPOUT_MS = 2500;
+static const uint32_t TUNE_TIMEOUT_MS = 6000;
 
-// ─── Power Offset Correction ─────────────────────────────────────────────────
-//
-// Some spin bikes report inflated or deflated power values due to sensor
-// calibration assumptions that don't match the bike's drivetrain. This
-// framework lets you correct for a known cadence-dependent offset.
-//
-// Set ENABLE_OFFSET_CORRECTION to true and populate the calibration table
-// below with values measured on your specific bike. The correction is
-// disabled by default and the table is zeroed — no behaviour changes unless
-// you explicitly enable it.
-//
-// ── How to calibrate ──
-// 1. Set flywheel resistance to zero.
-// 2. Hold each target cadence steady for ~60 seconds.
-// 3. Note the average reported watts — this is your offset at that cadence.
-// 4. Enter the values in OFFSET_WATTS below.
-// 5. Set ENABLE_OFFSET_CORRECTION to true.
-//
-// Offsets can be positive (sensor reads too high) or negative (sensor reads
-// too low). The correction is applied before smoothing.
-//
-// CORRECTION_FACTOR controls how much of the offset is applied:
-//   0.0 = no correction
-//   0.5 = half correction
-//   1.0 = full correction
-//
-// Start at 1.0 for maximum accuracy. If corrected power feels too low during
-// easy riding, try 0.5 as a compromise.
-//
-// ── Example: Bodi MYX II (positive offset — sensor reads too high) ──
-// Measured at zero resistance, ~60 seconds per cadence:
-//
-//   static const float OFFSET_CADENCE[] = { 60.0f,  70.0f,  80.0f,  90.0f };
-//   static const float OFFSET_WATTS[]   = { 87.0f,  97.0f, 106.0f, 112.0f };
-//
-// ── Example: hypothetical bike with negative offset (sensor reads too low) ──
-//
-//   static const float OFFSET_CADENCE[] = { 60.0f,  70.0f,  80.0f,  90.0f };
-//   static const float OFFSET_WATTS[]   = { -20.0f, -22.0f, -25.0f, -28.0f };
+static const uint8_t CP_OP_START_OFFSET_COMPENSATION = 0x0C;
+static const uint8_t CP_OP_START_ENHANCED_OFFSET_COMPENSATION = 0x10;
+static const uint8_t CP_OP_RESPONSE_CODE = 0x20;
+static const uint8_t CP_RESPONSE_SUCCESS = 0x01;
+static const uint8_t CP_RESPONSE_NOT_SUPPORTED = 0x02;
+static const uint8_t CP_RESPONSE_OPERATION_FAILED = 0x04;
 
-static const bool  ENABLE_OFFSET_CORRECTION = false;
-static const float CORRECTION_FACTOR        = 1.0f;
-
-static const int   OFFSET_TABLE_SIZE = 4;
-static const float OFFSET_CADENCE[]  = { 60.0f,  70.0f,  80.0f,  90.0f };
-static const float OFFSET_WATTS[]    = {  0.0f,   0.0f,   0.0f,   0.0f };
-
-/**
- * Returns the interpolated power offset for a given cadence.
- * - Below the lowest cadence point: returns the lowest offset value
- * - Above the highest cadence point: linearly extrapolates
- * - Between points: linearly interpolates
- */
-float getOffsetForCadence(float cadence) {
-    if (cadence <= 0.0f) return 0.0f;
-
-    // Below table minimum — return lowest offset
-    if (cadence <= OFFSET_CADENCE[0]) return OFFSET_WATTS[0];
-
-    // Above table maximum — extrapolate from last two points
-    if (cadence >= OFFSET_CADENCE[OFFSET_TABLE_SIZE - 1]) {
-        float slope = (OFFSET_WATTS[OFFSET_TABLE_SIZE - 1] - OFFSET_WATTS[OFFSET_TABLE_SIZE - 2])
-                    / (OFFSET_CADENCE[OFFSET_TABLE_SIZE - 1] - OFFSET_CADENCE[OFFSET_TABLE_SIZE - 2]);
-        return OFFSET_WATTS[OFFSET_TABLE_SIZE - 1]
-             + slope * (cadence - OFFSET_CADENCE[OFFSET_TABLE_SIZE - 1]);
-    }
-
-    // Linear interpolation between surrounding points
-    for (int i = 0; i < OFFSET_TABLE_SIZE - 1; i++) {
-        if (cadence >= OFFSET_CADENCE[i] && cadence <= OFFSET_CADENCE[i + 1]) {
-            float t = (cadence - OFFSET_CADENCE[i])
-                    / (OFFSET_CADENCE[i + 1] - OFFSET_CADENCE[i]);
-            return OFFSET_WATTS[i] + t * (OFFSET_WATTS[i + 1] - OFFSET_WATTS[i]);
-        }
-    }
-
-    return 0.0f;  // Fallback — should never reach here
-}
-
-// ─── BLE UUIDs ──────────────────────────────────────────────────────────────
-
-// Standard Bluetooth Cycling Power Service
+// Standard Bluetooth UUIDs
 static BLEUUID CPS_SERVICE_UUID((uint16_t)0x1818);
-static BLEUUID CPS_MEASUREMENT_UUID((uint16_t)0x2A63);  // Notify
-static BLEUUID CPS_FEATURE_UUID((uint16_t)0x2A65);      // Read
-static BLEUUID SENSOR_LOCATION_UUID((uint16_t)0x2A5D);  // Read
-static BLEUUID CPS_CONTROL_POINT_UUID((uint16_t)0x2A66); // Write + Indicate
-
-// Standard Bluetooth Battery Service
+static BLEUUID CPS_MEASUREMENT_UUID((uint16_t)0x2A63);
+static BLEUUID CPS_FEATURE_UUID((uint16_t)0x2A65);
+static BLEUUID SENSOR_LOCATION_UUID((uint16_t)0x2A5D);
+static BLEUUID CPS_CONTROL_POINT_UUID((uint16_t)0x2A66);
 static BLEUUID BATTERY_SERVICE_UUID((uint16_t)0x180F);
 static BLEUUID BATTERY_LEVEL_UUID((uint16_t)0x2A19);
-
-// Standard Bluetooth Cycling Speed & Cadence Service
-// Many apps read cadence from CSC rather than from CPS crank data
 static BLEUUID CSC_SERVICE_UUID((uint16_t)0x1816);
-static BLEUUID CSC_MEASUREMENT_UUID((uint16_t)0x2A5B);   // Notify
-static BLEUUID CSC_FEATURE_UUID((uint16_t)0x2A5C);       // Read
+static BLEUUID CSC_MEASUREMENT_UUID((uint16_t)0x2A5B);
+static BLEUUID CSC_FEATURE_UUID((uint16_t)0x2A5C);
 
-// ─── Global State ───────────────────────────────────────────────────────────
+// Calibration settings stored in NVS.
+struct CalibrationSettings {
+    bool correctionEnabled;
+    bool rawDiagnosticsEnabled;
+    float localZeroOffset;
+    float scaleFactor;
+    float cadence[4];
+    float cadenceOffset[4];
+};
 
-// BLE Client (connection to the real sensor)
+static CalibrationSettings calibration = {
+    false,
+    false,
+    0.0f,
+    1.0f,
+    {60.0f, 70.0f, 80.0f, 90.0f},
+    {0.0f, 0.0f, 0.0f, 0.0f}
+};
+
+enum TuneState {
+    TUNE_IDLE,
+    TUNE_NO_CONTROL_POINT,
+    TUNE_STANDARD_SENT,
+    TUNE_ENHANCED_SENT,
+    TUNE_SUCCESS,
+    TUNE_NOT_SUPPORTED,
+    TUNE_FAILED,
+    TUNE_TIMEOUT
+};
+
+// BLE client state: connection to the real sensor.
 static BLEAdvertisedDevice* sensorDevice = nullptr;
 static BLEClient* bleClient = nullptr;
+static BLERemoteCharacteristic* remotePowerControlPoint = nullptr;
 static bool sensorConnected = false;
+static bool remoteControlPointReady = false;
 static bool doConnect = false;
 static bool doScan = true;
 
-// BLE Server (what apps connect to)
+// BLE server state: what apps connect to.
 static BLEServer* bleServer = nullptr;
 static BLECharacteristic* powerMeasurementChar = nullptr;
-static BLECharacteristic* powerFeatureChar = nullptr;
-static BLECharacteristic* sensorLocationChar = nullptr;
 static BLECharacteristic* powerControlPointChar = nullptr;
 static BLECharacteristic* cscMeasurementChar = nullptr;
 static BLECharacteristic* batteryLevelChar = nullptr;
-static bool clientSubscribed = false;
 static int appConnectionCount = 0;
 
-// Latest decoded data for serial output
-static volatile uint8_t  lastBattery = 0xFF;  // 0xFF = unknown
-static volatile int16_t  lastPower = 0;
+// Web and storage.
+static Preferences preferences;
+static WebServer webServer(80);
+
+// Latest decoded/corrected data for logs and the calibration UI.
+static volatile uint8_t lastBattery = 0xFF;
+static volatile int16_t lastRawPower = 0;
+static volatile int16_t lastZeroedPower = 0;
+static volatile int16_t lastCorrectedPower = 0;
+static volatile int16_t lastBroadcastPower = 0;
 static volatile uint16_t lastCrankRev = 0;
 static volatile uint16_t lastCrankTime = 0;
 static volatile uint16_t lastEnergy = 0;
+static volatile float lastCadence = 0.0f;
+static volatile bool lastDropped = false;
+static volatile float lastAppliedCadenceOffset = 0.0f;
 
-// For cadence calculation
+// Cadence and smoothing state.
 static uint16_t prevCrankRev = 0;
 static uint16_t prevCrankTime = 0;
-static float    lastCadence = 0.0f;
-
-// ─── Smoothing + Dropout State ───────────────────────────────────────────────
-
-// EMA accumulator — zeroed immediately on dropout so stale values from a
-// previous effort don't bleed into the next one.
-static float    smoothedPower   = 0.0f;
-
-// Timestamp of the last crank revolution increment. Updated ONLY when cRev
-// changes, not on every packet arrival — otherwise the dropout timer would
-// never fire while the sensor keeps sending packets at rest.
+static float smoothedPower = 0.0f;
 static uint32_t lastCrankMoveMs = 0;
 
-// LED feedback
+// Sensor tune state.
+static volatile TuneState tuneState = TUNE_IDLE;
+static volatile uint8_t tuneLastOp = 0;
+static volatile uint8_t tuneLastResponse = 0;
+static volatile int16_t tuneReportedOffset = 0;
+static volatile uint8_t tuneFailureReason = 0;
+static bool tuneRequested = false;
+static uint32_t tuneStartedMs = 0;
+
 #ifndef LED_PIN
-#define LED_PIN 2  // Built-in LED on most ESP32 boards
+#define LED_PIN 2
 #endif
 static unsigned long lastBlinkTime = 0;
 static bool ledState = false;
 
-// ─── Utility Functions ──────────────────────────────────────────────────────
+static const char* tuneStateText(TuneState state) {
+    switch (state) {
+        case TUNE_IDLE: return "idle";
+        case TUNE_NO_CONTROL_POINT: return "sensor control point unavailable";
+        case TUNE_STANDARD_SENT: return "standard tune requested";
+        case TUNE_ENHANCED_SENT: return "enhanced tune requested";
+        case TUNE_SUCCESS: return "tune complete";
+        case TUNE_NOT_SUPPORTED: return "sensor tune not supported";
+        case TUNE_FAILED: return "sensor tune failed";
+        case TUNE_TIMEOUT: return "sensor tune timed out";
+        default: return "unknown";
+    }
+}
 
-/**
- * Called when the sensor sends a Battery Level notification.
- */
+static void loadCalibration() {
+    preferences.begin("cal", true);
+    calibration.correctionEnabled = preferences.getBool("enabled", calibration.correctionEnabled);
+    calibration.rawDiagnosticsEnabled = preferences.getBool("rawdiag", calibration.rawDiagnosticsEnabled);
+    calibration.localZeroOffset = preferences.getFloat("zero", calibration.localZeroOffset);
+    calibration.scaleFactor = preferences.getFloat("scale", calibration.scaleFactor);
+    for (int i = 0; i < 4; i++) {
+        char key[12];
+        snprintf(key, sizeof(key), "cad%d", i);
+        calibration.cadence[i] = preferences.getFloat(key, calibration.cadence[i]);
+        snprintf(key, sizeof(key), "off%d", i);
+        calibration.cadenceOffset[i] = preferences.getFloat(key, calibration.cadenceOffset[i]);
+    }
+    preferences.end();
+
+    if (!isfinite(calibration.scaleFactor) || calibration.scaleFactor < 0.05f || calibration.scaleFactor > 50.0f) {
+        calibration.scaleFactor = 1.0f;
+    }
+}
+
+static void saveCalibration() {
+    preferences.begin("cal", false);
+    preferences.putBool("enabled", calibration.correctionEnabled);
+    preferences.putBool("rawdiag", calibration.rawDiagnosticsEnabled);
+    preferences.putFloat("zero", calibration.localZeroOffset);
+    preferences.putFloat("scale", calibration.scaleFactor);
+    for (int i = 0; i < 4; i++) {
+        char key[12];
+        snprintf(key, sizeof(key), "cad%d", i);
+        preferences.putFloat(key, calibration.cadence[i]);
+        snprintf(key, sizeof(key), "off%d", i);
+        preferences.putFloat(key, calibration.cadenceOffset[i]);
+    }
+    preferences.end();
+}
+
+static void resetCalibration() {
+    calibration = {
+        false,
+        false,
+        0.0f,
+        1.0f,
+        {60.0f, 70.0f, 80.0f, 90.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f}
+    };
+    saveCalibration();
+}
+
+static float getCadenceOffset(float cadence) {
+    if (cadence <= 0.0f) return 0.0f;
+
+    if (cadence <= calibration.cadence[0]) {
+        float dCad = calibration.cadence[1] - calibration.cadence[0];
+        if (fabs(dCad) < 0.001f) return calibration.cadenceOffset[0];
+        float slope = (calibration.cadenceOffset[1] - calibration.cadenceOffset[0]) / dCad;
+        return calibration.cadenceOffset[0] + slope * (cadence - calibration.cadence[0]);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (cadence >= calibration.cadence[i] && cadence <= calibration.cadence[i + 1]) {
+            float dCad = calibration.cadence[i + 1] - calibration.cadence[i];
+            if (fabs(dCad) < 0.001f) return calibration.cadenceOffset[i];
+            float t = (cadence - calibration.cadence[i]) / dCad;
+            return calibration.cadenceOffset[i] + t * (calibration.cadenceOffset[i + 1] - calibration.cadenceOffset[i]);
+        }
+    }
+
+    float dCad = calibration.cadence[3] - calibration.cadence[2];
+    if (fabs(dCad) < 0.001f) return calibration.cadenceOffset[3];
+    float slope = (calibration.cadenceOffset[3] - calibration.cadenceOffset[2]) / dCad;
+    return calibration.cadenceOffset[3] + slope * (cadence - calibration.cadence[3]);
+}
+
+static int16_t clampPowerToInt16(float watts) {
+    if (!isfinite(watts)) return 0;
+    if (watts < 0.0f) return 0;
+    if (watts > 32767.0f) return 32767;
+    return (int16_t)(watts + 0.5f);
+}
+
+static void xorDecode(uint8_t* data, size_t len, uint8_t key) {
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= key;
+    }
+}
+
+static float calcCadence(uint16_t currRev, uint16_t currTime, uint16_t prevRev, uint16_t prevTime) {
+    uint16_t dRev = (uint16_t)(currRev - prevRev);
+    uint16_t dTime = (uint16_t)(currTime - prevTime);
+    if (dRev == 0 || dTime == 0) return 0.0f;
+    return 60.0f * 1024.0f * (float)dRev / (float)dTime;
+}
+
+static void jsonEscapePrint(const char* text) {
+    while (*text) {
+        char c = *text++;
+        if (c == '"' || c == '\\') webServer.sendContent("\\");
+        char out[2] = {c, '\0'};
+        webServer.sendContent(out);
+    }
+}
+
+static void remoteControlPointCallback(
+    BLERemoteCharacteristic* pChar,
+    uint8_t* pData,
+    size_t length,
+    bool isNotify)
+{
+    if (length < 3 || pData[0] != CP_OP_RESPONSE_CODE) return;
+
+    tuneLastOp = pData[1];
+    tuneLastResponse = pData[2];
+    tuneFailureReason = 0;
+    tuneReportedOffset = 0;
+
+    if (length >= 5) {
+        tuneReportedOffset = (int16_t)(pData[3] | (pData[4] << 8));
+    } else if (length >= 4) {
+        tuneFailureReason = pData[3];
+    }
+
+    if (tuneLastResponse == CP_RESPONSE_SUCCESS) {
+        tuneState = TUNE_SUCCESS;
+        Serial.printf("[TUNE] Sensor tune complete. Offset result: %d\n", tuneReportedOffset);
+    } else if (tuneLastResponse == CP_RESPONSE_NOT_SUPPORTED) {
+        tuneState = TUNE_NOT_SUPPORTED;
+        Serial.printf("[TUNE] Sensor rejected op 0x%02X as not supported\n", tuneLastOp);
+    } else if (tuneLastResponse == CP_RESPONSE_OPERATION_FAILED) {
+        tuneState = TUNE_FAILED;
+        Serial.printf("[TUNE] Sensor tune failed for op 0x%02X, reason 0x%02X\n", tuneLastOp, tuneFailureReason);
+    } else {
+        tuneState = TUNE_FAILED;
+        Serial.printf("[TUNE] Sensor tune response for op 0x%02X: 0x%02X\n", tuneLastOp, tuneLastResponse);
+    }
+}
+
 static void batteryNotifyCallback(
     BLERemoteCharacteristic* pChar,
     uint8_t* pData,
@@ -242,45 +302,52 @@ static void batteryNotifyCallback(
     }
 }
 
-/**
- * XOR-decode a buffer in place with the mask byte.
- */
-void xorDecode(uint8_t* data, size_t len, uint8_t key) {
-    for (size_t i = 0; i < len; i++) {
-        data[i] ^= key;
+static bool writeSensorTuneOp(uint8_t opCode, TuneState waitingState) {
+    if (!remoteControlPointReady || remotePowerControlPoint == nullptr) {
+        tuneState = TUNE_NO_CONTROL_POINT;
+        Serial.println("[TUNE] Sensor Cycling Power Control Point unavailable");
+        return false;
+    }
+
+    uint8_t payload[1] = {opCode};
+    tuneLastOp = opCode;
+    tuneLastResponse = 0;
+    tuneReportedOffset = 0;
+    tuneFailureReason = 0;
+    tuneState = waitingState;
+    tuneStartedMs = millis();
+    remotePowerControlPoint->writeValue(payload, sizeof(payload), true);
+    Serial.printf("[TUNE] Sent sensor tune op 0x%02X\n", opCode);
+    return true;
+}
+
+static void serviceTuneState() {
+    if (tuneRequested) {
+        tuneRequested = false;
+        writeSensorTuneOp(CP_OP_START_OFFSET_COMPENSATION, TUNE_STANDARD_SENT);
+    }
+
+    if ((tuneState == TUNE_STANDARD_SENT || tuneState == TUNE_ENHANCED_SENT) &&
+        millis() - tuneStartedMs > TUNE_TIMEOUT_MS) {
+        if (tuneState == TUNE_STANDARD_SENT) {
+            Serial.println("[TUNE] Standard tune timed out; trying enhanced tune");
+            writeSensorTuneOp(CP_OP_START_ENHANCED_OFFSET_COMPENSATION, TUNE_ENHANCED_SENT);
+        } else {
+            tuneState = TUNE_TIMEOUT;
+            Serial.println("[TUNE] Enhanced tune timed out");
+        }
+    }
+
+    if (tuneState == TUNE_NOT_SUPPORTED && tuneLastOp == CP_OP_START_OFFSET_COMPENSATION) {
+        Serial.println("[TUNE] Standard tune unsupported; trying enhanced tune");
+        writeSensorTuneOp(CP_OP_START_ENHANCED_OFFSET_COMPENSATION, TUNE_ENHANCED_SENT);
     }
 }
-
-/**
- * Calculate cadence in RPM from cumulative crank revolution data.
- * Handles uint16 wraparound.
- */
-float calcCadence(uint16_t currRev, uint16_t currTime, uint16_t prevRev, uint16_t prevTime) {
-    uint16_t dRev  = (uint16_t)(currRev - prevRev);
-    uint16_t dTime = (uint16_t)(currTime - prevTime);
-    if (dRev == 0 || dTime == 0) return 0.0f;
-    return 60.0f * 1024.0f * (float)dRev / (float)dTime;
-}
-
-/**
- * Print a hex buffer to Serial.
- */
-void printHex(const uint8_t* data, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        if (i > 0) Serial.print(" ");
-        if (data[i] < 0x10) Serial.print("0");
-        Serial.print(data[i], HEX);
-    }
-}
-
-// ─── BLE Server Callbacks (apps connecting to us) ───────────────────────────
 
 class BridgeServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
         appConnectionCount++;
         Serial.printf("[SERVER] App connected! (%d total)\n", appConnectionCount);
-
-        // Allow more connections (for multiple apps)
         BLEDevice::startAdvertising();
     }
 
@@ -288,34 +355,23 @@ class BridgeServerCallbacks : public BLEServerCallbacks {
         appConnectionCount--;
         if (appConnectionCount < 0) appConnectionCount = 0;
         Serial.printf("[SERVER] App disconnected. (%d remaining)\n", appConnectionCount);
-
-        // Re-start advertising
         BLEDevice::startAdvertising();
     }
 };
 
-// Minimal Cycling Power Control Point handler — responds "not supported" to
-// every op-code so apps that probe capabilities don't see a BLE error.
 class ControlPointCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pCharacteristic) override {
         std::string value = pCharacteristic->getValue();
-        if (value.length() > 0) {
-            uint8_t opCode = value[0];
-            // Response: [0x20 = Response Op Code, reqOpCode, 0x02 = Not Supported]
-            uint8_t response[3] = {0x20, opCode, 0x02};
-            pCharacteristic->setValue(response, 3);
-            pCharacteristic->indicate();
-            Serial.printf("[SERVER] Control Point op 0x%02X → not supported\n", opCode);
-        }
+        if (value.length() == 0) return;
+
+        uint8_t opCode = (uint8_t)value[0];
+        uint8_t response[3] = {CP_OP_RESPONSE_CODE, opCode, CP_RESPONSE_NOT_SUPPORTED};
+        pCharacteristic->setValue(response, sizeof(response));
+        pCharacteristic->indicate();
+        Serial.printf("[SERVER] App Control Point op 0x%02X -> not supported\n", opCode);
     }
 };
 
-// ─── BLE Client Notification Callback (data from sensor) ────────────────────
-
-/**
- * Called every time the sensor sends a Cycling Power Measurement notification.
- * This is the core decode + rebroadcast logic.
- */
 static void notifyCallback(
     BLERemoteCharacteristic* pBLERemoteCharacteristic,
     uint8_t* pData,
@@ -327,132 +383,84 @@ static void notifyCallback(
         return;
     }
 
-    // Make a working copy
     uint8_t decoded[20];
     size_t copyLen = (length > sizeof(decoded)) ? sizeof(decoded) : length;
     memcpy(decoded, pData, copyLen);
-
-    // XOR decode
     xorDecode(decoded, copyLen, XOR_KEY);
 
-    // Parse fields (little-endian)
-    uint16_t flags  = (uint16_t)(decoded[0] | (decoded[1] << 8));
-    int16_t  power  = (int16_t)(decoded[2] | (decoded[3] << 8));
-    uint16_t cRev   = (uint16_t)(decoded[4] | (decoded[5] << 8));
-    uint16_t cTime  = (uint16_t)(decoded[6] | (decoded[7] << 8));
+    int16_t rawPower = (int16_t)(decoded[2] | (decoded[3] << 8));
+    uint16_t cRev = (uint16_t)(decoded[4] | (decoded[5] << 8));
+    uint16_t cTime = (uint16_t)(decoded[6] | (decoded[7] << 8));
     uint16_t energy = (uint16_t)(decoded[8] | (decoded[9] << 8));
 
-    // ── Dropout watchdog ──
-    // Update the crank movement timestamp ONLY when cRev actually changes.
-    // If we updated on every packet the timer would never fire at rest.
     if (cRev != prevCrankRev) {
         lastCrankMoveMs = millis();
     }
 
     bool dropped = (millis() - lastCrankMoveMs > DROPOUT_MS);
+    int16_t zeroedPower = rawPower;
+    int16_t correctedPower = rawPower;
+    int16_t broadcastPower = 0;
+    float cadence = 0.0f;
+    float cadenceOffset = 0.0f;
 
     if (dropped) {
-        // Immediate reset — zero everything and broadcast.
-        // Zeroing smoothedPower prevents stale values bleeding into the next effort.
-        power         = 0;
         smoothedPower = 0.0f;
-        lastCadence   = 0.0f;
-        lastPower     = 0;
     } else {
-        // Calculate cadence
-        float cadence = calcCadence(cRev, cTime, prevCrankRev, prevCrankTime);
-        if (cadence > 0.0f && cadence < 200.0f) {
-            lastCadence = cadence;
-        } else if (cRev != prevCrankRev) {
-            // Crank moved but cadence is out of range — keep last known
-        } else {
-            lastCadence = 0.0f;  // No movement
+        cadence = calcCadence(cRev, cTime, prevCrankRev, prevCrankTime);
+        if (!(cadence > 0.0f && cadence < 200.0f)) {
+            cadence = (cRev != prevCrankRev) ? lastCadence : 0.0f;
         }
 
-        // ── Apply cadence-indexed offset correction ──
-        // Subtracts a fraction (CORRECTION_FACTOR) of the measured offset.
-        // Only applied when correction is enabled and cadence is active.
-        // Applied before smoothing so the smoother works on corrected values.
-        int16_t rawPower = power;
-        if (ENABLE_OFFSET_CORRECTION && lastCadence > 0.0f) {
-            float offset = getOffsetForCadence(lastCadence) * CORRECTION_FACTOR;
-            power = (int16_t)(power - (int16_t)offset);
-        }
-
-        // Clamp corrected power to zero minimum
-        if (power < 0) power = 0;
-
-        // Store for display
-        lastPower     = power;
-        lastCrankRev  = cRev;
-        lastCrankTime = cTime;
-        lastEnergy    = energy;
-
-        // ── Exponential moving average smoothing ──
-        smoothedPower = (power * SMOOTHING_FACTOR) + (smoothedPower * (1.0f - SMOOTHING_FACTOR));
-        power = (int16_t)smoothedPower;
-
-        // Serial debug output (throttled to unique changes)
-        static int16_t prevPrintPower = -999;
-        static uint16_t prevPrintRev = 0xFFFF;
-        if (power != prevPrintPower || cRev != prevPrintRev) {
-            if (ENABLE_OFFSET_CORRECTION && lastCadence > 0.0f) {
-                Serial.printf("[DATA] Power: %4d W (raw: %4d W, offset: %4.0f W, factor: %.1f) | Cadence: %5.1f RPM | CrankRev: %5u | Energy: %5u kJ\n",
-                              power, rawPower,
-                              getOffsetForCadence(lastCadence) * CORRECTION_FACTOR,
-                              CORRECTION_FACTOR, lastCadence, cRev, energy);
-            } else {
-                Serial.printf("[DATA] Power: %4d W | Cadence: %5.1f RPM | CrankRev: %5u | Energy: %5u kJ\n",
-                              power, lastCadence, cRev, energy);
+        float workingPower = (float)rawPower;
+        if (calibration.correctionEnabled) {
+            workingPower -= calibration.localZeroOffset;
+            zeroedPower = (int16_t)roundf(workingPower);
+            if (cadence > 0.0f) {
+                cadenceOffset = getCadenceOffset(cadence);
+                workingPower -= cadenceOffset;
             }
-            prevPrintPower = power;
-            prevPrintRev   = cRev;
+            workingPower *= calibration.scaleFactor;
         }
+
+        correctedPower = clampPowerToInt16(workingPower);
+        smoothedPower = (correctedPower * SMOOTHING_FACTOR) + (smoothedPower * (1.0f - SMOOTHING_FACTOR));
+        broadcastPower = clampPowerToInt16(smoothedPower);
     }
 
-    prevCrankRev  = cRev;
+    lastRawPower = rawPower;
+    lastZeroedPower = zeroedPower;
+    lastCorrectedPower = dropped ? 0 : correctedPower;
+    lastBroadcastPower = broadcastPower;
+    lastCrankRev = cRev;
+    lastCrankTime = cTime;
+    lastEnergy = energy;
+    lastCadence = dropped ? 0.0f : cadence;
+    lastDropped = dropped;
+    lastAppliedCadenceOffset = cadenceOffset;
+
+    prevCrankRev = cRev;
     prevCrankTime = cTime;
 
-    // ── Re-broadcast as standard Cycling Power Measurement ──
-    // Build a PROPER BLE Cycling Power Measurement per Bluetooth spec.
-    // Flags 0x0020 = bit 5 (Crank Revolution Data Present)
-    // We intentionally strip the Accumulated Energy flag since most apps
-    // don't use it and it keeps the packet cleaner.
-    // If you want energy too, use flags 0x0820 and append 2 more bytes.
-    //
-    // Standard packet layout with crank data:
-    //   [0-1]  Flags (uint16 LE)            = 0x0020
-    //   [2-3]  Instantaneous Power (sint16 LE, watts)
-    //   [4-5]  Cumulative Crank Revolutions (uint16 LE)
-    //   [6-7]  Last Crank Event Time (uint16 LE, 1/1024 s)
-
     uint8_t outBuf[8];
-    uint16_t outFlags = 0x0020;  // Crank Revolution Data Present
-
+    uint16_t outFlags = 0x0020;
     outBuf[0] = outFlags & 0xFF;
     outBuf[1] = (outFlags >> 8) & 0xFF;
-    outBuf[2] = (uint8_t)(power & 0xFF);
-    outBuf[3] = (uint8_t)((power >> 8) & 0xFF);
+    outBuf[2] = (uint8_t)(broadcastPower & 0xFF);
+    outBuf[3] = (uint8_t)((broadcastPower >> 8) & 0xFF);
     outBuf[4] = cRev & 0xFF;
     outBuf[5] = (cRev >> 8) & 0xFF;
     outBuf[6] = cTime & 0xFF;
     outBuf[7] = (cTime >> 8) & 0xFF;
 
-    // Send to connected app(s)
     if (powerMeasurementChar != nullptr) {
         powerMeasurementChar->setValue(outBuf, sizeof(outBuf));
         powerMeasurementChar->notify();
     }
 
-    // ── Also send CSC Measurement for cadence ──
-    // Many apps only read cadence from the CSC Service (0x1816), not CPS.
-    // CSC Measurement format:
-    //   [0]    Flags (uint8)  = 0x02 (Crank Revolution Data Present)
-    //   [1-2]  Cumulative Crank Revolutions (uint16 LE)
-    //   [3-4]  Last Crank Event Time (uint16 LE, 1/1024 s)
     if (cscMeasurementChar != nullptr) {
         uint8_t cscBuf[5];
-        cscBuf[0] = 0x02;  // Crank Revolution Data Present
+        cscBuf[0] = 0x02;
         cscBuf[1] = cRev & 0xFF;
         cscBuf[2] = (cRev >> 8) & 0xFF;
         cscBuf[3] = cTime & 0xFF;
@@ -461,12 +469,23 @@ static void notifyCallback(
         cscMeasurementChar->notify();
     }
 
-    if (dropped) {
-        Serial.println("[DATA] Dropout — power and cadence zeroed.");
+    static int16_t prevPrintPower = -999;
+    static uint16_t prevPrintRev = 0xFFFF;
+    if (broadcastPower != prevPrintPower || cRev != prevPrintRev || dropped) {
+        if (calibration.rawDiagnosticsEnabled) {
+            Serial.printf("[DATA] Raw: %d W | Zeroed: %d W | Corrected: %d W | Broadcast: %d W | Cadence: %.1f RPM | Offset: %.1f W | Scale: %.3f | Rev: %u | Energy: %u kJ%s\n",
+                          rawPower, zeroedPower, correctedPower, broadcastPower, (double)lastCadence,
+                          (double)cadenceOffset, (double)calibration.scaleFactor, cRev, energy,
+                          dropped ? " | DROPPED" : "");
+        } else {
+            Serial.printf("[DATA] Power: %4d W | Cadence: %5.1f RPM | CrankRev: %5u | Energy: %5u kJ%s\n",
+                          broadcastPower, (double)lastCadence, cRev, energy,
+                          dropped ? " | DROPPED" : "");
+        }
+        prevPrintPower = broadcastPower;
+        prevPrintRev = cRev;
     }
 }
-
-// ─── BLE Client Callbacks (connection to sensor) ────────────────────────────
 
 class SensorClientCallbacks : public BLEClientCallbacks {
     void onConnect(BLEClient* pclient) override {
@@ -477,22 +496,19 @@ class SensorClientCallbacks : public BLEClientCallbacks {
     void onDisconnect(BLEClient* pclient) override {
         Serial.println("[SENSOR] Disconnected from power meter!");
         sensorConnected = false;
-        doScan = true;  // Trigger re-scan
+        remoteControlPointReady = false;
+        remotePowerControlPoint = nullptr;
+        doScan = true;
     }
 };
 
-// ─── BLE Scan Callbacks (finding the sensor) ────────────────────────────────
-
 class SensorScanCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) override {
-        // Check if device advertises the Cycling Power Service
         if (advertisedDevice.haveServiceUUID() &&
             advertisedDevice.isAdvertisingService(CPS_SERVICE_UUID)) {
-
-            // Optional: filter by name prefix
             String devName = advertisedDevice.getName().c_str();
             if (strlen(TARGET_SENSOR_NAME) > 0 && !devName.startsWith(TARGET_SENSOR_NAME)) {
-                Serial.printf("[SCAN] Found CPS device '%s' but name doesn't match filter '%s'\n",
+                Serial.printf("[SCAN] Found CPS device '%s' but name does not match filter '%s'\n",
                               devName.c_str(), TARGET_SENSOR_NAME);
                 return;
             }
@@ -509,9 +525,7 @@ class SensorScanCallbacks : public BLEAdvertisedDeviceCallbacks {
     }
 };
 
-// ─── Connect to the Sensor ──────────────────────────────────────────────────
-
-bool connectToSensor() {
+static bool connectToSensor() {
     if (sensorDevice == nullptr) return false;
 
     Serial.printf("[SENSOR] Connecting to %s ...\n", sensorDevice->getAddress().toString().c_str());
@@ -519,14 +533,11 @@ bool connectToSensor() {
     bleClient = BLEDevice::createClient();
     bleClient->setClientCallbacks(new SensorClientCallbacks());
 
-    // Connect
     if (!bleClient->connect(sensorDevice)) {
         Serial.println("[SENSOR] Connection failed!");
         return false;
     }
-    Serial.println("[SENSOR] Connected!");
 
-    // Get Cycling Power Service
     BLERemoteService* remoteService = bleClient->getService(CPS_SERVICE_UUID);
     if (remoteService == nullptr) {
         Serial.println("[SENSOR] Cycling Power Service not found!");
@@ -535,24 +546,39 @@ bool connectToSensor() {
     }
     Serial.println("[SENSOR] Found Cycling Power Service (0x1818)");
 
-    // Get Power Measurement characteristic (0x2A63)
     BLERemoteCharacteristic* remoteMeasurement = remoteService->getCharacteristic(CPS_MEASUREMENT_UUID);
     if (remoteMeasurement == nullptr) {
         Serial.println("[SENSOR] Power Measurement characteristic not found!");
         bleClient->disconnect();
         return false;
     }
-    Serial.println("[SENSOR] Found Power Measurement characteristic (0x2A63)");
 
-    // Subscribe to notifications
     if (remoteMeasurement->canNotify()) {
         remoteMeasurement->registerForNotify(notifyCallback);
-        Serial.println("[SENSOR] Subscribed to power notifications!");
+        Serial.println("[SENSOR] Subscribed to power notifications");
     } else {
-        Serial.println("[SENSOR] WARNING: Characteristic doesn't support Notify!");
+        Serial.println("[SENSOR] WARNING: measurement characteristic does not notify");
     }
 
-    // Read sensor location for debug info
+    remotePowerControlPoint = remoteService->getCharacteristic(CPS_CONTROL_POINT_UUID);
+    remoteControlPointReady = false;
+    if (remotePowerControlPoint != nullptr) {
+        if (remotePowerControlPoint->canIndicate()) {
+            remotePowerControlPoint->registerForNotify(remoteControlPointCallback, false);
+            remoteControlPointReady = true;
+            Serial.println("[TUNE] Remote Cycling Power Control Point found with indications");
+        } else if (remotePowerControlPoint->canNotify()) {
+            remotePowerControlPoint->registerForNotify(remoteControlPointCallback, true);
+            remoteControlPointReady = true;
+            Serial.println("[TUNE] Remote Cycling Power Control Point found with notifications");
+        } else {
+            Serial.println("[TUNE] Remote Cycling Power Control Point found but cannot indicate/notify");
+        }
+    } else {
+        Serial.println("[TUNE] Remote Cycling Power Control Point not found");
+        tuneState = TUNE_NO_CONTROL_POINT;
+    }
+
     BLERemoteCharacteristic* remoteLocation = remoteService->getCharacteristic(SENSOR_LOCATION_UUID);
     if (remoteLocation != nullptr && remoteLocation->canRead()) {
         std::string locVal = remoteLocation->readValue();
@@ -561,7 +587,6 @@ bool connectToSensor() {
         }
     }
 
-    // Read feature for debug info
     BLERemoteCharacteristic* remoteFeature = remoteService->getCharacteristic(CPS_FEATURE_UUID);
     if (remoteFeature != nullptr && remoteFeature->canRead()) {
         std::string featVal = remoteFeature->readValue();
@@ -572,12 +597,10 @@ bool connectToSensor() {
         Serial.println();
     }
 
-    // ── Battery Service (0x180F / 0x2A19) ──
     BLERemoteService* remoteBattService = bleClient->getService(BATTERY_SERVICE_UUID);
     if (remoteBattService != nullptr) {
         BLERemoteCharacteristic* remoteBattChar = remoteBattService->getCharacteristic(BATTERY_LEVEL_UUID);
         if (remoteBattChar != nullptr) {
-            // Initial read
             if (remoteBattChar->canRead()) {
                 std::string battVal = remoteBattChar->readValue();
                 if (battVal.length() > 0) {
@@ -589,68 +612,249 @@ bool connectToSensor() {
                     }
                 }
             }
-            // Subscribe to notifications
             if (remoteBattChar->canNotify()) {
                 remoteBattChar->registerForNotify(batteryNotifyCallback);
-                Serial.println("[SENSOR] Subscribed to battery notifications!");
+                Serial.println("[SENSOR] Subscribed to battery notifications");
             }
-        } else {
-            Serial.println("[SENSOR] Battery Level characteristic (0x2A19) not found");
         }
-    } else {
-        Serial.println("[SENSOR] Battery Service (0x180F) not found");
     }
 
-    // Initialize dropout timer now that we're connected
     lastCrankMoveMs = millis();
-
     sensorConnected = true;
     return true;
 }
 
-// ─── Setup BLE Server (what apps see) ───────────────────────────────────────
+static void handleWebRoot() {
+    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webServer.send(200, "text/html", "");
+    webServer.sendContent(
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>MYX Bridge Calibration</title>"
+        "<style>"
+        ":root{font-family:Segoe UI,Arial,sans-serif;color:#17212b;background:#eef2f6}"
+        "body{margin:0;padding:22px}main{max-width:980px;margin:auto}"
+        "h1{margin:0 0 4px;font-size:28px}.sub{color:#5d6b78;margin:0 0 18px}"
+        ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}"
+        ".card{background:#fff;border:1px solid #d7dde4;border-radius:8px;padding:14px;box-shadow:0 1px 3px #0001}"
+        ".big{font-size:30px;font-weight:700}.muted{color:#64717f}.ok{color:#0b7f4f}.bad{color:#b32828}"
+        "label{display:block;margin:8px 0 4px;font-size:13px;color:#3d4a57}"
+        "input{box-sizing:border-box;width:100%;padding:9px;border:1px solid #c9d1d9;border-radius:6px;font-size:15px}"
+        "input[type=checkbox]{width:auto;margin-right:6px}button,.btn{border:0;background:#0b5fff;color:#fff;padding:10px 13px;border-radius:6px;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block}"
+        "button.secondary,.btn.secondary{background:#4e5b67}button.warn{background:#aa3a2d}.row{display:flex;justify-content:space-between;gap:10px;margin:7px 0}"
+        ".actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.table{display:grid;grid-template-columns:1fr 1fr;gap:8px}"
+        "code{background:#edf1f5;padding:2px 5px;border-radius:4px}@media(max-width:560px){body{padding:14px}.big{font-size:24px}}"
+        "</style></head><body><main>"
+        "<h1>MYX Bridge Calibration</h1>"
+        "<p class='sub'>Connect apps to MYX Bridge as usual. Use this page only for sensor tuning and correction.</p>"
+        "<div class='grid'>"
+        "<section class='card'><h2>Broadcast</h2><div class='big' id='broadcast'>0 W</div><div class='muted' id='cadence'>0 rpm</div></section>"
+        "<section class='card'><h2>Raw Diagnostics</h2><div class='row'><span>Raw</span><b id='raw'>0 W</b></div><div class='row'><span>Zeroed</span><b id='zeroed'>0 W</b></div><div class='row'><span>Corrected</span><b id='corrected'>0 W</b></div><div class='row'><span>Applied cadence offset</span><b id='appliedOffset'>0 W</b></div></section>"
+        "<section class='card'><h2>Connections</h2><div class='row'><span>Sensor</span><b id='sensor'>searching</b></div><div class='row'><span>Apps</span><b id='apps'>0</b></div><div class='row'><span>Battery</span><b id='battery'>?</b></div><div class='row'><span>Control point</span><b id='cp'>unknown</b></div></section>"
+        "<section class='card'><h2>Sensor Tune</h2><p class='muted'>Pedal about 30 seconds, get off the bike, set the crank vertical, then press tune and stay off the bike.</p><div class='row'><span>Status</span><b id='tune'>idle</b></div><div class='row'><span>Returned offset</span><b id='tuneOffset'>0</b></div><div class='actions'><button onclick='tuneSensor()'>Tune Sensor</button></div></section>"
+        "</div>"
+        "<form class='card' method='post' action='/settings'><h2>Local Fallback Correction</h2>"
+        "<label><input type='checkbox' name='enabled' id='enabled'>Correction enabled</label>"
+        "<label><input type='checkbox' name='rawdiag' id='rawdiag'>Raw diagnostics enabled</label>"
+        "<label>Local zero offset, watts<input name='zero' id='zero' type='number' step='0.1'></label>"
+        "<label>Scale factor<input name='scale' id='scale' type='number' step='0.001' min='0.05' max='50'></label>"
+        "<div class='table'>"
+        "<label>Cadence 1<input name='cad0' id='cad0' type='number' step='0.1'></label><label>Offset 1<input name='off0' id='off0' type='number' step='0.1'></label>"
+        "<label>Cadence 2<input name='cad1' id='cad1' type='number' step='0.1'></label><label>Offset 2<input name='off1' id='off1' type='number' step='0.1'></label>"
+        "<label>Cadence 3<input name='cad2' id='cad2' type='number' step='0.1'></label><label>Offset 3<input name='off2' id='off2' type='number' step='0.1'></label>"
+        "<label>Cadence 4<input name='cad3' id='cad3' type='number' step='0.1'></label><label>Offset 4<input name='off3' id='off3' type='number' step='0.1'></label>"
+        "</div><div class='actions'><button type='submit'>Save settings</button><a class='btn secondary' href='/api/settings'>Export JSON</a><button class='warn' type='button' onclick='resetSettings()'>Reset defaults</button></div></form>"
+        "</main><script>"
+        "let initialized=false;"
+        "function setVal(id,v){document.getElementById(id).textContent=v}"
+        "function setInput(id,v){if(!initialized)document.getElementById(id).value=v}"
+        "async function refresh(){let r=await fetch('/api/status');let d=await r.json();"
+        "setVal('broadcast',d.broadcastPower+' W');setVal('cadence',d.cadence.toFixed(1)+' rpm');"
+        "setVal('raw',d.rawPower+' W');setVal('zeroed',d.zeroedPower+' W');setVal('corrected',d.correctedPower+' W');setVal('appliedOffset',d.appliedCadenceOffset.toFixed(1)+' W');"
+        "setVal('sensor',d.sensorConnected?'connected':'searching');setVal('apps',d.appConnections);setVal('battery',d.battery);setVal('cp',d.remoteControlPointReady?'ready':'unavailable');"
+        "setVal('tune',d.tuneStatus);setVal('tuneOffset',d.tuneReportedOffset);"
+        "if(!initialized){document.getElementById('enabled').checked=d.settings.enabled;document.getElementById('rawdiag').checked=d.settings.rawDiagnostics;"
+        "setInput('zero',d.settings.localZeroOffset);setInput('scale',d.settings.scaleFactor);"
+        "for(let i=0;i<4;i++){setInput('cad'+i,d.settings.cadence[i]);setInput('off'+i,d.settings.cadenceOffset[i]);}initialized=true;}}"
+        "async function tuneSensor(){await fetch('/tune',{method:'POST'});refresh();}"
+        "async function resetSettings(){if(confirm('Reset calibration settings?')){await fetch('/reset',{method:'POST'});initialized=false;refresh();}}"
+        "refresh();setInterval(refresh,1000);</script></body></html>");
+    webServer.sendContent("");
+}
 
-void setupBLEServer() {
+static float argFloat(const char* name, float fallback) {
+    if (!webServer.hasArg(name)) return fallback;
+    return webServer.arg(name).toFloat();
+}
+
+static void handleWebSettingsPost() {
+    calibration.correctionEnabled = webServer.hasArg("enabled");
+    calibration.rawDiagnosticsEnabled = webServer.hasArg("rawdiag");
+    calibration.localZeroOffset = argFloat("zero", calibration.localZeroOffset);
+    calibration.scaleFactor = argFloat("scale", calibration.scaleFactor);
+    if (!isfinite(calibration.scaleFactor) || calibration.scaleFactor < 0.05f) calibration.scaleFactor = 1.0f;
+    if (calibration.scaleFactor > 50.0f) calibration.scaleFactor = 50.0f;
+    for (int i = 0; i < 4; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "cad%d", i);
+        calibration.cadence[i] = argFloat(key, calibration.cadence[i]);
+        snprintf(key, sizeof(key), "off%d", i);
+        calibration.cadenceOffset[i] = argFloat(key, calibration.cadenceOffset[i]);
+    }
+    saveCalibration();
+    webServer.sendHeader("Location", "/", true);
+    webServer.send(303, "text/plain", "Saved");
+}
+
+static void sendSettingsJsonOnly() {
+    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webServer.send(200, "application/json", "");
+    webServer.sendContent("{\"enabled\":");
+    webServer.sendContent(calibration.correctionEnabled ? "true" : "false");
+    webServer.sendContent(",\"rawDiagnostics\":");
+    webServer.sendContent(calibration.rawDiagnosticsEnabled ? "true" : "false");
+    webServer.sendContent(",\"localZeroOffset\":");
+    webServer.sendContent(String(calibration.localZeroOffset, 3));
+    webServer.sendContent(",\"scaleFactor\":");
+    webServer.sendContent(String(calibration.scaleFactor, 6));
+    webServer.sendContent(",\"cadence\":[");
+    for (int i = 0; i < 4; i++) {
+        if (i) webServer.sendContent(",");
+        webServer.sendContent(String(calibration.cadence[i], 3));
+    }
+    webServer.sendContent("],\"cadenceOffset\":[");
+    for (int i = 0; i < 4; i++) {
+        if (i) webServer.sendContent(",");
+        webServer.sendContent(String(calibration.cadenceOffset[i], 3));
+    }
+    webServer.sendContent("]}");
+    webServer.sendContent("");
+}
+
+static void handleWebStatusJson() {
+    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webServer.send(200, "application/json", "");
+    webServer.sendContent("{\"sensorConnected\":");
+    webServer.sendContent(sensorConnected ? "true" : "false");
+    webServer.sendContent(",\"appConnections\":");
+    webServer.sendContent(String(appConnectionCount));
+    webServer.sendContent(",\"battery\":\"");
+    if (lastBattery == 0xFF) webServer.sendContent("?");
+    else webServer.sendContent(String((int)lastBattery) + "%");
+    webServer.sendContent("\",\"rawPower\":");
+    webServer.sendContent(String((int)lastRawPower));
+    webServer.sendContent(",\"zeroedPower\":");
+    webServer.sendContent(String((int)lastZeroedPower));
+    webServer.sendContent(",\"correctedPower\":");
+    webServer.sendContent(String((int)lastCorrectedPower));
+    webServer.sendContent(",\"broadcastPower\":");
+    webServer.sendContent(String((int)lastBroadcastPower));
+    webServer.sendContent(",\"cadence\":");
+    webServer.sendContent(String((double)lastCadence, 3));
+    webServer.sendContent(",\"crankRev\":");
+    webServer.sendContent(String((unsigned int)lastCrankRev));
+    webServer.sendContent(",\"crankTime\":");
+    webServer.sendContent(String((unsigned int)lastCrankTime));
+    webServer.sendContent(",\"energy\":");
+    webServer.sendContent(String((unsigned int)lastEnergy));
+    webServer.sendContent(",\"dropped\":");
+    webServer.sendContent(lastDropped ? "true" : "false");
+    webServer.sendContent(",\"appliedCadenceOffset\":");
+    webServer.sendContent(String((double)lastAppliedCadenceOffset, 3));
+    webServer.sendContent(",\"remoteControlPointReady\":");
+    webServer.sendContent(remoteControlPointReady ? "true" : "false");
+    webServer.sendContent(",\"tuneStatus\":\"");
+    jsonEscapePrint(tuneStateText((TuneState)tuneState));
+    webServer.sendContent("\",\"tuneLastOp\":");
+    webServer.sendContent(String((int)tuneLastOp));
+    webServer.sendContent(",\"tuneLastResponse\":");
+    webServer.sendContent(String((int)tuneLastResponse));
+    webServer.sendContent(",\"tuneReportedOffset\":");
+    webServer.sendContent(String((int)tuneReportedOffset));
+    webServer.sendContent(",\"tuneFailureReason\":");
+    webServer.sendContent(String((int)tuneFailureReason));
+    webServer.sendContent(",\"settings\":");
+    webServer.sendContent("{\"enabled\":");
+    webServer.sendContent(calibration.correctionEnabled ? "true" : "false");
+    webServer.sendContent(",\"rawDiagnostics\":");
+    webServer.sendContent(calibration.rawDiagnosticsEnabled ? "true" : "false");
+    webServer.sendContent(",\"localZeroOffset\":");
+    webServer.sendContent(String(calibration.localZeroOffset, 3));
+    webServer.sendContent(",\"scaleFactor\":");
+    webServer.sendContent(String(calibration.scaleFactor, 6));
+    webServer.sendContent(",\"cadence\":[");
+    for (int i = 0; i < 4; i++) {
+        if (i) webServer.sendContent(",");
+        webServer.sendContent(String(calibration.cadence[i], 3));
+    }
+    webServer.sendContent("],\"cadenceOffset\":[");
+    for (int i = 0; i < 4; i++) {
+        if (i) webServer.sendContent(",");
+        webServer.sendContent(String(calibration.cadenceOffset[i], 3));
+    }
+    webServer.sendContent("]}}");
+    webServer.sendContent("");
+}
+
+static void handleTunePost() {
+    tuneRequested = true;
+    tuneState = TUNE_IDLE;
+    webServer.send(202, "application/json", "{\"status\":\"queued\"}");
+}
+
+static void handleResetPost() {
+    resetCalibration();
+    webServer.send(200, "application/json", "{\"status\":\"reset\"}");
+}
+
+static void handleNotFound() {
+    webServer.send(404, "text/plain", "Not found");
+}
+
+static void setupCalibrationPortal() {
+    WiFi.mode(WIFI_AP);
+    bool apStarted = strlen(CAL_AP_PASS) > 0 ? WiFi.softAP(CAL_AP_NAME, CAL_AP_PASS) : WiFi.softAP(CAL_AP_NAME);
+    Serial.printf("[WEB] Calibration AP %s: %s\n", apStarted ? "started" : "failed", CAL_AP_NAME);
+    Serial.printf("[WEB] Calibration portal: http://%s/\n", WiFi.softAPIP().toString().c_str());
+
+    webServer.on("/", HTTP_GET, handleWebRoot);
+    webServer.on("/api/status", HTTP_GET, handleWebStatusJson);
+    webServer.on("/api/settings", HTTP_GET, sendSettingsJsonOnly);
+    webServer.on("/settings", HTTP_POST, handleWebSettingsPost);
+    webServer.on("/tune", HTTP_POST, handleTunePost);
+    webServer.on("/reset", HTTP_POST, handleResetPost);
+    webServer.onNotFound(handleNotFound);
+    webServer.begin();
+}
+
+static void setupBLEServer() {
     Serial.println("[SERVER] Setting up BLE Cycling Power Service...");
 
     bleServer = BLEDevice::createServer();
     bleServer->setCallbacks(new BridgeServerCallbacks());
 
-    // Create Cycling Power Service (20 handles for all chars + descriptors)
     BLEService* cpsService = bleServer->createService(CPS_SERVICE_UUID, 20);
 
-    // ── Power Measurement Characteristic (0x2A63) ──
-    // Properties: Notify only (per BLE spec)
     powerMeasurementChar = cpsService->createCharacteristic(
         CPS_MEASUREMENT_UUID,
         BLECharacteristic::PROPERTY_NOTIFY
     );
-    // Add Client Characteristic Configuration Descriptor (required for Notify)
     powerMeasurementChar->addDescriptor(new BLE2902());
 
-    // ── Power Feature Characteristic (0x2A65) ──
-    // Properties: Read
-    // Bit 3 = Crank Revolution Data Supported → 0x08
-    powerFeatureChar = cpsService->createCharacteristic(
+    BLECharacteristic* powerFeatureChar = cpsService->createCharacteristic(
         CPS_FEATURE_UUID,
         BLECharacteristic::PROPERTY_READ
     );
-    uint8_t featureValue[4] = {0x08, 0x00, 0x00, 0x00};  // Crank Rev Data Supported
+    uint8_t featureValue[4] = {0x08, 0x00, 0x00, 0x00};
     powerFeatureChar->setValue(featureValue, 4);
 
-    // ── Sensor Location Characteristic (0x2A5D) ──
-    // Value: 0x05 = Left Crank
-    sensorLocationChar = cpsService->createCharacteristic(
+    BLECharacteristic* sensorLocationChar = cpsService->createCharacteristic(
         SENSOR_LOCATION_UUID,
         BLECharacteristic::PROPERTY_READ
     );
-    uint8_t sensorLoc = 0x05;  // Left Crank
+    uint8_t sensorLoc = 0x05;
     sensorLocationChar->setValue(&sensorLoc, 1);
 
-    // ── Cycling Power Control Point (0x2A66) ──
-    // Some apps probe this to discover sensor capabilities.
-    // We respond "Op Code Not Supported" to every request, which is
-    // spec-legal and stops apps from reporting a connection error.
     powerControlPointChar = cpsService->createCharacteristic(
         CPS_CONTROL_POINT_UUID,
         BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_INDICATE
@@ -660,9 +864,7 @@ void setupBLEServer() {
 
     cpsService->start();
 
-    // ── Cycling Speed & Cadence Service (0x1816) ──
     BLEService* cscService = bleServer->createService(CSC_SERVICE_UUID, 12);
-
     cscMeasurementChar = cscService->createCharacteristic(
         CSC_MEASUREMENT_UUID,
         BLECharacteristic::PROPERTY_NOTIFY
@@ -682,10 +884,8 @@ void setupBLEServer() {
     );
     uint8_t cscLoc = 0x05;
     cscSensorLoc->setValue(&cscLoc, 1);
-
     cscService->start();
 
-    // ── Device Information Service (0x180A) ──
     BLEService* disService = bleServer->createService(BLEUUID((uint16_t)0x180A));
     BLECharacteristic* mfgNameChar = disService->createCharacteristic(
         BLEUUID((uint16_t)0x2A29), BLECharacteristic::PROPERTY_READ);
@@ -698,7 +898,6 @@ void setupBLEServer() {
     fwRevChar->setValue(FW_VERSION);
     disService->start();
 
-    // ── Battery Service (0x180F) ──
     BLEService* battService = bleServer->createService(BATTERY_SERVICE_UUID, 8);
     batteryLevelChar = battService->createCharacteristic(
         BATTERY_LEVEL_UUID,
@@ -709,7 +908,6 @@ void setupBLEServer() {
     batteryLevelChar->setValue(&initBatt, 1);
     battService->start();
 
-    // Set up advertising
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(CPS_SERVICE_UUID);
     pAdvertising->addServiceUUID(CSC_SERVICE_UUID);
@@ -720,23 +918,8 @@ void setupBLEServer() {
     pAdvertising->setMaxPreferred(0x12);
     BLEDevice::startAdvertising();
 
-    Serial.printf("[SERVER] Advertising as '%s' with Cycling Power Service\n", BRIDGE_NAME);
-    Serial.printf("[SERVER] Smoothing factor: %.1f | Dropout timeout: %d ms\n",
-                  SMOOTHING_FACTOR, DROPOUT_MS);
-    if (ENABLE_OFFSET_CORRECTION) {
-        Serial.printf("[OFFSET] Correction ENABLED | Factor: %.1f\n", CORRECTION_FACTOR);
-        Serial.println("[OFFSET] Calibration table:");
-        for (int i = 0; i < OFFSET_TABLE_SIZE; i++) {
-            Serial.printf("[OFFSET]   %.0f rpm → %.0f W (%.0f W applied)\n",
-                          OFFSET_CADENCE[i], OFFSET_WATTS[i],
-                          OFFSET_WATTS[i] * CORRECTION_FACTOR);
-        }
-    } else {
-        Serial.println("[OFFSET] Correction DISABLED — broadcasting raw sensor values");
-    }
+    Serial.printf("[SERVER] Advertising as '%s'\n", BRIDGE_NAME);
 }
-
-// ─── Arduino Setup ──────────────────────────────────────────────────────────
 
 void setup() {
     Serial.begin(115200);
@@ -745,44 +928,38 @@ void setup() {
     Serial.println();
     Serial.println("=========================================");
     Serial.println("  ESP32 BLE Bike Power Meter Bridge");
-    Serial.printf ("  Firmware: %s\n", FW_VERSION);
+    Serial.printf("  Firmware: %s\n", FW_VERSION);
     Serial.println("=========================================");
-    Serial.println();
-    Serial.println("This device connects to your MYX/BKSNSR");
-    Serial.println("power meter, decodes the XOR-masked data,");
-    Serial.println("and re-broadcasts it as a standard BLE");
-    Serial.println("Cycling Power Service.");
-    Serial.println();
 
-    // LED setup
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
-
-    // Safe initial value for dropout timer
     lastCrankMoveMs = millis();
 
-    // Initialize BLE with enough memory for both client and server roles
+    loadCalibration();
+    Serial.printf("[CAL] Correction: %s | Raw diagnostics: %s | Zero: %.1f W | Scale: %.3f\n",
+                  calibration.correctionEnabled ? "enabled" : "disabled",
+                  calibration.rawDiagnosticsEnabled ? "enabled" : "disabled",
+                  (double)calibration.localZeroOffset,
+                  (double)calibration.scaleFactor);
+
     BLEDevice::init(BRIDGE_NAME);
-
-    // Set up the server side first (so apps can find us immediately)
     setupBLEServer();
+    setupCalibrationPortal();
 
-    // Start scanning for the sensor
     Serial.println("[SCAN] Starting BLE scan for power meter...");
     BLEScan* pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new SensorScanCallbacks());
     pBLEScan->setInterval(1349);
     pBLEScan->setWindow(449);
     pBLEScan->setActiveScan(true);
-    pBLEScan->start(10, false);  // Scan for 10 seconds
-
-    Serial.println("[SCAN] Initial scan started...");
+    pBLEScan->start(10, false);
+    Serial.println("[SCAN] Initial scan started");
 }
 
-// ─── Arduino Loop ───────────────────────────────────────────────────────────
-
 void loop() {
-    // ── Handle connection to sensor ──
+    webServer.handleClient();
+    serviceTuneState();
+
     if (doConnect) {
         if (connectToSensor()) {
             Serial.println("[OK] Bridge is active! Power data will flow through.");
@@ -793,14 +970,12 @@ void loop() {
         doConnect = false;
     }
 
-    // ── Handle re-scan if disconnected ──
     if (!sensorConnected && doScan) {
         Serial.println("[SCAN] Re-scanning for power meter...");
         BLEDevice::getScan()->start(10, false);
         doScan = false;
     }
 
-    // ── LED status feedback ──
     unsigned long now = millis();
     if (sensorConnected && appConnectionCount > 0) {
         if (!ledState) {
@@ -821,19 +996,20 @@ void loop() {
         }
     }
 
-    // ── Periodic status print ──
     static unsigned long lastStatusTime = 0;
     if (now - lastStatusTime > 10000) {
         lastStatusTime = now;
         char battStr[8];
         if (lastBattery == 0xFF) snprintf(battStr, sizeof(battStr), "?");
         else snprintf(battStr, sizeof(battStr), "%d%%", lastBattery);
-        Serial.printf("[STATUS] Sensor: %s | Apps: %d | Power: %d W | Cadence: %.0f RPM | Battery: %s\n",
+        Serial.printf("[STATUS] Sensor: %s | Apps: %d | Raw: %d W | Broadcast: %d W | Cadence: %.0f RPM | Battery: %s | Tune: %s\n",
                       sensorConnected ? "CONNECTED" : "SEARCHING",
                       appConnectionCount,
-                      (int)lastPower,
-                      lastCadence,
-                      battStr);
+                      (int)lastRawPower,
+                      (int)lastBroadcastPower,
+                      (double)lastCadence,
+                      battStr,
+                      tuneStateText((TuneState)tuneState));
     }
 
     delay(10);

@@ -32,6 +32,7 @@ The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unr
 - Auto-connects to any nearby MYX bike sensor on boot — no configuration needed
 - Supports multiple simultaneous app connections (Zwift + phone, etc.)
 - LED status indicator for connection state
+- Local calibration portal at `MYX-Bridge-Calibrate` for sensor tuning, raw diagnostics, and fallback correction
 - Standard BLE CPS (0x1818) + CSC (0x1816) services — works with every major cycling app
 
 ---
@@ -84,6 +85,30 @@ cd MYX-Power-Cadence-Bridge
 4. Open your app, scan for Bluetooth sensors, and connect to **"MYX Bridge"**
 
 The bridge appears as both a **Cycling Power Sensor** (power + cadence) and a **Speed & Cadence Sensor** (cadence) — connect to whichever your app prefers.
+
+### Calibration Portal
+
+The firmware starts a local Wi-Fi access point named **MYX-Bridge-Calibrate**. Connect a phone or computer to that network and open:
+
+```text
+http://192.168.4.1/
+```
+
+Use **Tune Sensor** first. This mirrors the OEM tablet flow:
+
+1. Pedal for about 30 seconds to wake the sensor
+2. Get off the bike
+3. Turn the crank/pedal to the vertical position
+4. Press **Tune Sensor**
+5. Stay off the bike until the page reports completion or failure
+
+If the sensor does not support remote tuning, enable **Raw diagnostics** and use the local fallback correction settings:
+
+- **Local zero offset** corrects a signed raw zero/tare error
+- **Scale factor** corrects readings that are consistently too low or too high
+- **Cadence offsets** correct cadence-linked zero-resistance bias
+
+Correction is disabled by default, so existing behavior is unchanged until you save calibration settings.
 
 ### LED Status
 
