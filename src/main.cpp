@@ -33,7 +33,6 @@ static const float SMOOTHING_FACTOR = 0.5f;
 static const uint32_t DROPOUT_MS = 2500;
 static const uint32_t TUNE_TIMEOUT_MS = 6000;
 
-static const uint8_t CP_OP_START_OFFSET_COMPENSATION = 0x0C;
 static const uint8_t CP_OP_START_ENHANCED_OFFSET_COMPENSATION = 0x10;
 static const uint8_t CP_OP_RESPONSE_CODE = 0x20;
 static const uint8_t CP_RESPONSE_SUCCESS = 0x01;
@@ -326,23 +325,13 @@ static bool writeSensorTuneOp(uint8_t opCode, TuneState waitingState) {
 static void serviceTuneState() {
     if (tuneRequested) {
         tuneRequested = false;
-        writeSensorTuneOp(CP_OP_START_OFFSET_COMPENSATION, TUNE_STANDARD_SENT);
+        writeSensorTuneOp(CP_OP_START_ENHANCED_OFFSET_COMPENSATION, TUNE_ENHANCED_SENT);
     }
 
     if ((tuneState == TUNE_STANDARD_SENT || tuneState == TUNE_ENHANCED_SENT) &&
         millis() - tuneStartedMs > TUNE_TIMEOUT_MS) {
-        if (tuneState == TUNE_STANDARD_SENT) {
-            Serial.println("[TUNE] Standard tune timed out; trying enhanced tune");
-            writeSensorTuneOp(CP_OP_START_ENHANCED_OFFSET_COMPENSATION, TUNE_ENHANCED_SENT);
-        } else {
-            tuneState = TUNE_TIMEOUT;
-            Serial.println("[TUNE] Enhanced tune timed out");
-        }
-    }
-
-    if (tuneState == TUNE_NOT_SUPPORTED && tuneLastOp == CP_OP_START_OFFSET_COMPENSATION) {
-        Serial.println("[TUNE] Standard tune unsupported; trying enhanced tune");
-        writeSensorTuneOp(CP_OP_START_ENHANCED_OFFSET_COMPENSATION, TUNE_ENHANCED_SENT);
+        tuneState = TUNE_TIMEOUT;
+        Serial.println("[TUNE] Enhanced tune timed out");
     }
 }
 
