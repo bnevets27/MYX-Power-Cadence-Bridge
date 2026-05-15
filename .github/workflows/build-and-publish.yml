@@ -53,8 +53,8 @@ jobs:
           path: ~/.platformio
           key: platformio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
 
-      - name: Install PlatformIO
-        run: pip install platformio
+      - name: Install build tools
+        run: pip install platformio esptool
 
       - name: Build firmware
         run: pio run -e ${{ matrix.target.env }}
