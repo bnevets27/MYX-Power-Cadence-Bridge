@@ -94,24 +94,6 @@ jobs:
               0x10000 "${DIST_DIR}/myx-bridge-${{ matrix.target.env }}-ota.bin"
           fi
 
-          cat > "${DIST_DIR}/manifest-${{ matrix.target.env }}.json" <<EOF
-          {
-            "name": "MYX Power & Cadence Bridge",
-            "version": "${GITHUB_REF_NAME}",
-            "new_install_prompt_erase": true,
-            "builds": [
-              {
-                "chipFamily": "${{ matrix.target.chip_family }}",
-                "parts": [
-                  {
-                    "path": "./myx-bridge-${{ matrix.target.env }}-factory.bin",
-                    "offset": 0
-                  }
-                ]
-              }
-            ]
-          }
-          EOF
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -139,10 +121,8 @@ jobs:
           files: |
             release-assets/myx-bridge-esp32-ota.bin
             release-assets/myx-bridge-esp32-factory.bin
-            release-assets/manifest-esp32.json
             release-assets/myx-bridge-esp32s3-ota.bin
             release-assets/myx-bridge-esp32s3-factory.bin
-            release-assets/manifest-esp32s3.json
           body: |
             ## Pick the firmware that fits your setup
 
