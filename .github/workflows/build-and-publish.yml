@@ -119,11 +119,49 @@ jobs:
           name: myx-bridge-${{ matrix.target.env }}
           path: dist/${{ matrix.target.env }}
 
-      - name: Publish GitHub release assets
-        if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: myx-bridge-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release assets and notes
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/${{ matrix.target.env }}/myx-bridge-${{ matrix.target.env }}-ota.bin
-            dist/${{ matrix.target.env }}/myx-bridge-${{ matrix.target.env }}-factory.bin
-            dist/${{ matrix.target.env }}/manifest-${{ matrix.target.env }}.json
+            release-assets/myx-bridge-esp32-ota.bin
+            release-assets/myx-bridge-esp32-factory.bin
+            release-assets/manifest-esp32.json
+            release-assets/myx-bridge-esp32s3-ota.bin
+            release-assets/myx-bridge-esp32s3-factory.bin
+            release-assets/manifest-esp32s3.json
+          body: |
+            ## Pick the firmware that fits your setup
+
+            ### Unified Firmware (${{ github.ref_name }})
+            | File | Board / Use |
+            |------|-------------|
+            | `myx-bridge-esp32-factory.bin` | **ESP32** (WROOM-32, DevKitC) first-time USB flash via `web.esphome.io` |
+            | `myx-bridge-esp32-ota.bin` | **ESP32** OTA update from `/update` page |
+            | `myx-bridge-esp32s3-factory.bin` | **ESP32-S3** (S3-DevKitC, S3-WROOM) first-time USB flash via `web.esphome.io` |
+            | `myx-bridge-esp32s3-ota.bin` | **ESP32-S3** OTA update from `/update` page |
+
+            ## How to Flash
+
+            1. Download the `*-factory.bin` for your board from the Assets below.
+            2. Open **[web.esphome.io](https://web.esphome.io)** in Chrome or Edge.
+            3. Plug in your ESP32 and place it in bootloader mode if needed.
+            4. Click **Install** -> **Browse** -> select the factory `.bin` -> select your COM port -> Flash.
+
+            ## Updating an Existing Device
+
+            1. Open your bridge web UI and go to `/update`.
+            2. Upload the matching `*-ota.bin` file for your board.
