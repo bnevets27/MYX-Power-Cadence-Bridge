@@ -3,229 +3,289 @@
 [![Release](https://img.shields.io/github/v/release/bnevets27/MYX-Power-Cadence-Bridge)](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An ESP32 firmware that bridges the **BODi MYX** bike's proprietary Bluetooth sensor to any standard cycling app - Zwift, TrainerRoad, Wahoo, Garmin, Apple Fitness+, and more.
+An ESP32 firmware that bridges the **BODi MYX** bike's proprietary Bluetooth sensor to standard cycling apps and now also includes:
 
-The MYX bike's built-in sensor (`BKSNSR*`) XOR-masks its BLE data, making it unreadable by third-party apps. This firmware runs on an ESP32 dev board, decodes the data in real time, and re-broadcasts it as a fully compliant BLE Cycling Power + Speed & Cadence sensor.
+- sensor tuning / diagnostics
+- local fallback correction
+- WiFi setup
+- LAN status UI
+- MQTT / Home Assistant publishing
+- OTA firmware updates
 
-> **Two versions are available** - choose the one that fits your setup:
->
-> | | **Calibration Dev Branch (this branch)** | [Home Assistant Edition](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/tree/ha-mqtt) |
-> |---|---|---|
-> | BLE bridge (Zwift, Wahoo, etc.) | ✅ | ✅ |
-> | Home Assistant / MQTT | ❌ | ✅ |
-> | Wi-Fi calibration AP + web portal | ✅ | ✅ |
-> | Sensor tune button (CP control point) | ✅ | ✅ |
-> | Raw diagnostics + local correction | ✅ | ✅ |
-> | OTA firmware updates | ❌ | ✅ |
-> | Setup complexity | **Developer / bench testing** | 5-min Wi-Fi setup |
->
-> **Not sure?** If you want a local calibration/tuning portal without MQTT, use this branch.
+This branch uses **one unified firmware image**. The BLE bridge remains the primary function.
+
+The MYX bike sensor (`BKSNSR*`) XOR-masks its BLE data, making it unreadable by third-party apps. This firmware decodes the data in real time and re-broadcasts it as a standard BLE Cycling Power + Speed & Cadence sensor while also serving a shared web UI and optional MQTT output.
 
 ---
 
-## Dev Branch Quick Start
+## Unified Behavior
 
-This branch is intended for development and validation of sensor tuning plus local correction.
+### AP-only / unprovisioned mode
 
-1. Build and flash the ESP32 (example for S3):
+If no WiFi has been saved yet:
 
-```bash
-python -m platformio run --target upload --environment esp32s3
-```
+1. Boot and begin BLE recovery
+2. Scan for the bike sensor
+3. Connect to the bike sensor
+4. Start the AP and shared web UI only after the sensor is connected
 
-2. Start serial monitor:
+If the bike sensor sleeps or disconnects:
 
-```bash
-python -m platformio device monitor --environment esp32s3 --baud 115200
-```
+- the AP shuts down
+- the bridge returns to BLE recovery indefinitely
+- once the bike sensor reconnects, the AP and UI return automatically
 
-3. Put the ESP32 physically near your bike sensor and pedal briefly to wake it.
-4. Wait for scan/connect logs, then open the calibration AP once connected:
+This is intentional. AP availability is tied to the sensor connection so the BLE bridge keeps priority.
 
-```text
-SSID: MYX-Bridge-Calibrate
-URL:  http://192.168.4.1/
-```
+### Provisioned LAN mode
 
-5. In Sensor Tune, run Tune Sensor while off the bike with crank vertical.
+If WiFi credentials are saved:
 
-### Interpreting "Returned offset"
+1. Boot and connect to WiFi
+2. Serve the same UI on LAN
+3. Recover the bike sensor in the background
 
-- A value such as `22` means the tune command completed and the sensor returned an offset result.
-- This is the sensor's reported control-point tune result value (not a direct watt reading).
-- Treat it as a successful calibration indicator unless status reports failure.
-- If needed, use Local Fallback Correction separately to fine-tune ride feel/power match.
+If the bike sensor sleeps or disconnects:
 
-### Developer Notes: How Tune Command Was Mapped
+- LAN UI stays up
+- MQTT stays up
+- OTA stays up
+- cached reconnect is tried first
+- BLE scan fallback continues until the sensor is rediscovered
 
-Reference document:
-
-- Bluetooth SIG Cycling Power Profile test spec (CPP.TS):
-  https://files.bluetooth.com/wp-content/uploads/dlm_uploads/2025/02/CPP.TS_.p13.pdf
-
-Implementation in this branch follows the Cycling Power Control Point model:
-
-- Service: Cycling Power Service (UUID 0x1818)
-- Characteristic: Cycling Power Control Point (UUID 0x2A66)
-- Standard tune attempt opcode: 0x0C (Start Offset Compensation)
-- Fallback tune attempt opcode: 0x10 (Start Enhanced Offset Compensation)
-- Response opcode from sensor: 0x20 (Response Code)
-
-Response parsing used in firmware:
-
-- Byte 0: 0x20 response code marker
-- Byte 1: opcode being answered (0x0C or 0x10)
-- Byte 2: response value (0x01 success, 0x02 not supported, 0x04 operation failed)
-- Bytes 3-4 (when present): signed 16-bit little-endian returned offset
-
-Why this sequence is used:
-
-- Send 0x0C first for broad compatibility.
-- If timeout or not supported, automatically try 0x10.
-- On success, surface returned offset in the calibration UI.
-- If no control point or failure, keep local fallback correction available.
+No reboot should be required just because the bike sensor went away.
 
 ---
 
 ## Features
 
-| Metric | Supported |
-|--------|-----------|
-| Power (watts) | ✅ |
-| Cadence (RPM) | ✅ |
-
-- Auto-connects to any nearby MYX bike sensor on boot - no configuration needed
-- Supports multiple simultaneous app connections (Zwift + phone, etc.)
-- LED status indicator for connection state
-- Local calibration portal at `MYX-Bridge-Calibrate` for sensor tuning, raw diagnostics, and fallback correction
-- Standard BLE CPS (0x1818) + CSC (0x1816) services — works with every major cycling app
+| Capability | Supported |
+|-----------|-----------|
+| BLE bridge for Zwift / TrainerRoad / Wahoo / Garmin / Apple Fitness+ | ✅ |
+| Multiple simultaneous BLE app connections | ✅ |
+| Sensor tune button | ✅ |
+| Enhanced tune opcode `0x10` | ✅ |
+| Raw diagnostics | ✅ |
+| Local fallback correction | ✅ |
+| Shared AP/LAN web UI | ✅ |
+| Separate WiFi and MQTT settings | ✅ |
+| MQTT test connection | ✅ |
+| Home Assistant discovery | ✅ |
+| OTA firmware upload | ✅ |
+| Cached sensor reconnect | ✅ |
 
 ---
 
 ## Hardware
 
-Any board built on the **original ESP32 chip** (dual-core Xtensa, with both Wi-Fi and BLE) works. Recommended:
+Any board built on the **original ESP32 chip** works well. Recommended:
 
-- **ESP32-DevKitC** or **ESP32-WROOM-32**
-- USB-C or Micro USB data cable for the initial flash, then any USB power source
+- **ESP32-DevKitC**
+- **ESP32-WROOM-32**
 
-No soldering or extra components required.
+Also supported:
 
-> **Compatibility note:**
-> - **ESP32-S3** - Compatible but still recommend the original ESP32
-> - **ESP32-S2** - incompatible, no BLE
-> - **ESP32-C3 / C6** - not currently supported
->
-> Minimum flash: **4MB** (standard on virtually all ESP32 dev boards).
+- **ESP32-S3-DevKitC**
+
+Not supported:
+
+- **ESP32-S2** - no BLE
+- **ESP32-C3 / C6** - not currently supported here
+
+Minimum flash: **4 MB**
 
 ---
 
-## Flashing
+## Building
 
-### Option 1 — Web Flasher (easiest, no software required)
-
-1. Download the latest [`firmware.bin`](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/releases/latest) from the Releases page
-2. Plug your ESP32 into your computer via USB
-3. Open **[web.esphome.io](https://web.esphome.io)** in Chrome or Edge
-4. Click **Install** → **Browse** → select `firmware.bin` → select your COM port → Flash
-5. Done - unplug and power the ESP32 near your bike
-
-> **Windows**: if no COM port appears you may need a USB driver — [CP2102](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers) or [CH340](https://www.wch-ic.com/downloads/CH341SER_EXE.html) depending on your board.
-
-### Option 2 — PlatformIO (for developers)
+### ESP32
 
 ```bash
-git clone https://github.com/bnevets27/MYX-Power-Cadence-Bridge
-cd MYX-Power-Cadence-Bridge
-# Open in VS Code with PlatformIO extension, then click Upload
+python -m platformio run -e esp32
+```
+
+### ESP32-S3
+
+```bash
+python -m platformio run -e esp32s3
+```
+
+### Flashing example
+
+```bash
+python -m platformio run --target upload --environment esp32
+```
+
+### Serial monitor
+
+```bash
+python -m platformio device monitor --environment esp32 --baud 115200
 ```
 
 ---
 
-## Usage
+## First Power-On
 
-1. Power on your MYX bike (wake the sensor by pedaling briefly)
-2. Plug the ESP32 into USB power and place it near the bike
-3. Watch the LED — once it blinks fast, the sensor is connected
-4. Open your app, scan for Bluetooth sensors, and connect to **"MYX Bridge"**
-
-The bridge appears as both a **Cycling Power Sensor** (power + cadence) and a **Speed & Cadence Sensor** (cadence) — connect to whichever your app prefers.
-
-### Calibration Portal
-
-On this dev branch, the firmware starts the local Wi-Fi access point **after sensor connection** so BLE scanning is not impacted. Once the sensor is connected, join **MYX-Bridge-Calibrate** and open:
+1. Place the ESP32 near the MYX bike sensor
+2. Pedal briefly to wake the bike sensor
+3. Wait for the bridge to connect
+4. If no WiFi is saved yet, join:
 
 ```text
-http://192.168.4.1/
+SSID: MYX-Bridge-Setup
+URL:  http://192.168.4.1/
 ```
 
-Use **Tune Sensor** first. This mirrors the OEM tablet flow:
+5. Use the shared page to:
+   - tune the sensor
+   - adjust local correction
+   - save WiFi
+   - save MQTT
+   - test MQTT
+
+Once WiFi is saved, the device reboots and the same UI moves to LAN mode.
+
+---
+
+## Shared Web UI
+
+The same page is used in AP and LAN mode and includes:
+
+- sensor status / reconnect status
+- tune / diagnostics
+- local fallback correction
+- WiFi settings
+- MQTT settings
+- status / log text
+- OTA entry point
+
+Important actions:
+
+- `Tune Sensor`
+- `Find Sensor Again`
+- `Reconnect Sensor`
+- `Save WiFi`
+- `Save MQTT`
+- `Test MQTT`
+- `Reset WiFi`
+- `Reset MQTT`
+- `Full Reset`
+
+### Reset behavior
+
+- `Reset WiFi` clears only WiFi settings
+- `Reset MQTT` clears only MQTT settings
+- `Full Reset` clears WiFi, MQTT, cached sensor identity, and calibration settings
+
+---
+
+## Tuning and Local Correction
+
+The firmware keeps the current dev-branch tuning and correction behavior.
+
+### Tune flow
 
 1. Pedal for about 30 seconds to wake the sensor
 2. Get off the bike
-3. Turn the crank/pedal to the vertical position
-4. Press **Tune Sensor**
-5. Stay off the bike until the page reports completion or failure
+3. Set the crank vertical
+4. Press `Tune Sensor`
+5. Wait for completion
 
-When tune succeeds, the page shows a Returned offset value. Example: `22` means the sensor accepted the tune request and returned an offset result of 22.
+This firmware uses **enhanced tune opcode `0x10`** as the default and only tune path.
 
-If the sensor does not support remote tuning, enable **Raw diagnostics** and use the local fallback correction settings:
+### If tuning is not enough
 
-- **Local zero offset** corrects a signed raw zero/tare error
-- **Scale factor** corrects readings that are consistently too low or too high
-- **Cadence offsets** correct cadence-linked zero-resistance bias
+Use local fallback correction:
 
-Correction is disabled by default, so existing behavior is unchanged until you save calibration settings.
+- `Local zero offset`
+- `Scale factor`
+- cadence-specific offsets
 
-### LED Status
+Raw diagnostics can also be enabled from the same page.
+
+---
+
+## MQTT / Home Assistant
+
+MQTT is configured separately from WiFi.
+
+- Saving WiFi does not change MQTT settings
+- Saving MQTT does not change WiFi settings
+- `Test MQTT` attempts a broker connection and reports success/failure in the UI
+
+Published metrics include:
+
+- power
+- cadence
+- battery
+- accumulated energy
+- sensor connected state
+
+Home Assistant discovery uses the standard `homeassistant` discovery prefix.
+
+---
+
+## OTA Updates
+
+Use the shared UI and open:
+
+```text
+/update
+```
+
+Upload a new `.bin` file and the bridge will flash and restart.
+
+The repo uses the OTA partition table in [partitions_ota.csv](partitions_ota.csv).
+
+---
+
+## LED Status
 
 | Pattern | State |
 |---------|-------|
-| Slow blink (1 s) | Scanning for bike sensor |
-| Fast blink (250 ms) | Sensor found, waiting for app |
-| Solid on | Fully active — sensor + app connected |
+| Slow blink (1 s) | Searching / recovering sensor |
+| Fast blink (250 ms) | Sensor connected, waiting for app |
+| Solid on | Sensor connected and at least one app connected |
 
 ---
 
 ## How It Works
 
+```text
+MYX Bike (BKSNSR*)          ESP32 Bridge                 Destinations
+  BLE sensor        ------> XOR decode    ----------->  Zwift / Wahoo / Garmin
+  XOR 0xAA masked             re-broadcast ----------->  MQTT / Home Assistant
+                                             --------->  AP or LAN web UI
 ```
-MYX Bike (BKSNSR*)          ESP32 Bridge             Your App
-  BLE sensor        ──────►  XOR decode    ──────►  Zwift / Wahoo
-  XOR 0xAA masked             re-broadcast           standard BLE
-```
 
-The MYX sensor transmits standard BLE Cycling Power Service packets but XOR-masks every byte with `0xAA`. This makes the raw power reading appear as `-21846 W` to any app trying to read it directly. The bridge decodes each packet and re-broadcasts it with the correct values.
-
-### Decoded Packet Format
-
-| Bytes | Field | Type | Notes |
-|-------|-------|------|-------|
-| 0–1 | Flags | uint16 LE | `0x0820` — crank data + energy present |
-| 2–3 | Instantaneous Power | sint16 LE | Watts |
-| 4–5 | Cumulative Crank Revolutions | uint16 LE | Used for cadence |
-| 6–7 | Last Crank Event Time | uint16 LE | 1/1024 s resolution |
-| 8–9 | Accumulated Energy | uint16 LE | kJ |
+The MYX sensor transmits Cycling Power Service packets but XOR-masks every byte with `0xAA`. The bridge decodes those packets and re-publishes the corrected values over BLE and optional MQTT while keeping diagnostics available in the shared UI.
 
 ---
 
 ## Troubleshooting
 
 **ESP32 can't find the sensor**
-Make sure the bike sensor is powered on and not already connected to another device — BLE sensors typically allow only one client connection at a time.
 
-**App can't find "MYX Bridge"**
-Restart the app (some cache old device lists) and confirm the ESP32 LED is blinking. Re-scan for sensors.
+Make sure the bike sensor is awake and not already connected to another device. The bridge keeps retrying.
 
-**Power reads 0 while pedaling**
-The sensor takes a couple of seconds to register movement. Check the serial monitor (115200 baud) — you should see `[DATA]` lines when data is flowing.
+**AP disappeared**
 
-**Multiple MYX bikes nearby**
-The ESP32 connects to the first `BKSNSR*` device found during its scan. For home use this is never a problem. In a gym, position the ESP32 physically close to your bike.
+In AP-only mode, that means the bike sensor disconnected or went to sleep. Pedal to wake the bike and the AP will return after sensor reconnect.
+
+**LAN UI stays up but the bike is disconnected**
+
+That is expected in provisioned mode. The bridge will try cached reconnect first and then keep scanning until the bike wakes up again.
+
+**MQTT test fails**
+
+Check that WiFi is connected, the broker host/port are correct, and any username/password is valid.
+
+**Power feels off after tune**
+
+Use local fallback correction for zero offset, scale, and cadence-specific adjustments.
 
 ---
 
 ## License
 
 MIT - free to use, modify, and distribute.
-
