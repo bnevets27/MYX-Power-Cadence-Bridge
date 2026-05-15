@@ -225,6 +225,23 @@ Home Assistant discovery uses the standard `homeassistant` discovery prefix.
 
 ---
 
+## Firmware Files
+
+Releases now publish two firmware types for each supported chip:
+
+- `myx-bridge-esp32-factory.bin`
+- `myx-bridge-esp32-ota.bin`
+- `myx-bridge-esp32s3-factory.bin`
+- `myx-bridge-esp32s3-ota.bin`
+
+Use the `factory` image for first-time USB flashing from tools such as `https://web.esphome.io/`.
+
+Use the `ota` image only when updating an already-installed bridge through the built-in web updater.
+
+The factory image is a merged binary that includes bootloader + partitions + app in the flash layout expected by ESP Web Tools.
+
+---
+
 ## OTA Updates
 
 Use the shared UI and open:
@@ -233,7 +250,7 @@ Use the shared UI and open:
 /update
 ```
 
-Upload a new `.bin` file and the bridge will flash and restart.
+Upload the matching `*-ota.bin` file for your board and the bridge will flash and restart.
 
 The repo uses the OTA partition table in [partitions_ota.csv](partitions_ota.csv).
 
