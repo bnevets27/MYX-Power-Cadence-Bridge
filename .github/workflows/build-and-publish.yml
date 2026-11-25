@@ -54,7 +54,7 @@ jobs:
           key: platformio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
 
       - name: Install build tools
-        run: pip install platformio esptool
+        run: pip install platformio==6.2.0 esptool==5.1.0
 
       - name: Build firmware
         run: pio run -e ${{ matrix.target.env }}

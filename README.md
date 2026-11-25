@@ -1,4 +1,4 @@
-# MYX Power & Cadence Bridge
+﻿# MYX Power & Cadence Bridge
 
 [![Release](https://img.shields.io/github/v/release/bnevets27/MYX-Power-Cadence-Bridge)](https://github.com/bnevets27/MYX-Power-Cadence-Bridge/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -22,20 +22,14 @@ The MYX bike sensor (`BKSNSR*`) XOR-masks its BLE data, making it unreadable by 
 
 ### AP-only / unprovisioned mode
 
-If no WiFi has been saved yet:
+On first boot, the bridge opens a temporary setup network for 10 minutes,
+independent of the bike sensor. Join it and choose a password in your browser.
+After setup, the password-protected AP is available when the sensor is connected.
+When the sensor sleeps, the AP stops and returns when the sensor reconnects.
 
-1. Boot and begin BLE recovery
-2. Scan for the bike sensor
-3. Connect to the bike sensor
-4. Start the AP and shared web UI only after the sensor is connected
-
-If the bike sensor sleeps or disconnects:
-
-- the AP shuts down
-- the bridge returns to BLE recovery indefinitely
-- once the bike sensor reconnects, the AP and UI return automatically
-
-This is intentional. AP availability is tied to the sensor connection so the BLE bridge keeps priority.
+To reopen setup after it expires, or to recover a forgotten password, release the
+board's BOOT button after startup, then hold it for five seconds. Setup is open
+for 10 minutes and accepts a new password without erasing existing settings.
 
 ### Provisioned LAN mode
 
@@ -61,18 +55,18 @@ No reboot should be required just because the bike sensor went away.
 
 | Capability | Supported |
 |-----------|-----------|
-| BLE bridge for Zwift / TrainerRoad / Wahoo / Garmin / Apple Fitness+ | ✅ |
-| Multiple simultaneous BLE app connections | ✅ |
-| Sensor tune button | ✅ |
-| Enhanced tune opcode `0x10` | ✅ |
-| Raw diagnostics | ✅ |
-| Local fallback correction | ✅ |
-| Shared AP/LAN web UI | ✅ |
-| Separate WiFi and MQTT settings | ✅ |
-| MQTT test connection | ✅ |
-| Home Assistant discovery | ✅ |
-| OTA firmware upload | ✅ |
-| Cached sensor reconnect | ✅ |
+| BLE bridge for Zwift / TrainerRoad / Wahoo / Garmin / Apple Fitness+ | âœ… |
+| Multiple simultaneous BLE app connections | âœ… |
+| Sensor tune button | âœ… |
+| Enhanced tune opcode `0x10` | âœ… |
+| Raw diagnostics | âœ… |
+| Local fallback correction | âœ… |
+| Shared AP/LAN web UI | âœ… |
+| Separate WiFi and MQTT settings | âœ… |
+| MQTT test connection | âœ… |
+| Home Assistant discovery | âœ… |
+| OTA firmware upload | âœ… |
+| Cached sensor reconnect | âœ… |
 
 ---
 
@@ -126,24 +120,26 @@ python -m platformio device monitor --environment esp32 --baud 115200
 
 ## First Power-On
 
-1. Place the ESP32 near the MYX bike sensor
-2. Pedal briefly to wake the bike sensor
-3. Wait for the bridge to connect
-4. If no WiFi is saved yet, join:
+1. Power on the ESP32 and join the open `MYX-Bridge-Setup` network.
+2. Open **http://192.168.4.1/** in a browser within 10 minutes.
+3. Choose and confirm an administrator password (8 to 63 printable ASCII characters).
+   Optionally enter your Wi-Fi network and password, then save and restart.
+4. Connect to your Wi-Fi network, or join `MYX-Bridge-Setup` using the new
+   password when the bike sensor is connected. Sign in as `admin` using that
+   password. If setup expires, release and then hold BOOT for five seconds to reopen it.
+5. Pedal to wake the bike sensor, then use the web interface for tuning and settings.
 
-```text
-SSID: MYX-Bridge-Setup
-URL:  http://192.168.4.1/
-```
+During the temporary setup window, anyone near the device can join its open
+network and choose credentials. Only open it in a trusted location. Existing
+installations from the earlier generated-password firmware must complete this
+setup once; saved Wi-Fi and MQTT settings are preserved unless changed.
 
-5. Use the shared page to:
-   - tune the sensor
-   - adjust local correction
-   - save WiFi
-   - save MQTT
-   - test MQTT
+The web interface uses HTTP Basic authentication over HTTP: credentials are not
+encrypted on the LAN. Use a trusted network. If saved Wi-Fi credentials stop
+working, a password-protected AP appears after the connection attempt times out.
 
-Once WiFi is saved, the device reboots and the same UI moves to LAN mode.
+Password fields are blank when opened; leave them blank to keep the saved value,
+or select the corresponding clear checkbox to remove it.
 
 ---
 
@@ -191,7 +187,21 @@ The firmware keeps the current dev-branch tuning and correction behavior.
 4. Press `Tune Sensor`
 5. Wait for completion
 
-This firmware uses **enhanced tune opcode `0x10`** as the default and only tune path.
+The bridge uses enhanced tune opcode `0x10` when the sensor advertises enhanced
+offset compensation; otherwise it uses standard opcode `0x0C`. If enhanced tune
+is explicitly rejected as unsupported, it retries using standard tune. The observed
+MYX standard success response does not include an offset, so the overview shows
+**Not reported** rather than a numeric value. See [tuning protocol](docs/tuning-protocol.md)
+for response handling and diagnostic details.
+
+Allow up to 30 seconds for the sensor to respond. If tuning times out, use
+**Reconnect Sensor** to establish a fresh connection before trying again.
+The bridge keeps an active tune from being interrupted by its measurement
+watchdog. A timeout still means no valid tune response was received; it does
+not mean calibration succeeded.
+
+MQTT configuration is under **Network Settings → MQTT Settings**. The Connections
+card links directly to it and provides **Test MQTT** for the saved configuration.
 
 ### If tuning is not enough
 

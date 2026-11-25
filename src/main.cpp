@@ -21,24 +21,49 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <WiFiManager.h>
 #include <Update.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <esp_system.h>
+#include <nvs.h>
 #include <math.h>
 
 // Product configuration
 static const char* TARGET_SENSOR_NAME = "BKSNSR";
 static const char* BRIDGE_NAME = "MYX Bridge";
 static const char* AP_NAME = "MYX-Bridge-Setup";
-static const char* AP_PASS = "";
-static const char* FW_VERSION = "2.1.0-unified";
+static char adminPassword[64];
+static bool adminConfigured = false;
+static bool setupWindow = false;
+static bool setupCommitted = false;
+static uint32_t setupStarted = 0;
+static char setupToken[33];
+static volatile bool bootButtonArmed = false;
+static volatile uint32_t bootButtonDown = 0;
+static volatile bool bootButtonPressed = false;
+static volatile bool bootButtonEvent = false;
+static portMUX_TYPE buttonMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void IRAM_ATTR onBootButtonEdge() {
+    portENTER_CRITICAL_ISR(&buttonMux);
+    uint32_t now = millis();
+    if (digitalRead(0) == HIGH) {
+        if (bootButtonArmed && bootButtonPressed && now - bootButtonDown >= 5000) bootButtonEvent = true;
+        bootButtonPressed = false;
+        bootButtonArmed = true;
+    } else if (bootButtonArmed) {
+        bootButtonDown = now;
+        bootButtonPressed = true;
+    }
+    portEXIT_CRITICAL_ISR(&buttonMux);
+}
+static const char* FW_VERSION = "2.1.4-unified";
 
 static const uint8_t XOR_KEY = 0xAA;
 static const float SMOOTHING_FACTOR = 0.5f;
 static const uint32_t DROPOUT_MS = 2500;
-static const uint32_t TUNE_TIMEOUT_MS = 6000;
+// Cycling Power Profile procedure timeout is the 30-second ATT transaction timeout.
+static const uint32_t TUNE_TIMEOUT_MS = 30000;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 15000;
 static const uint32_t MQTT_RETRY_INTERVAL_MS = 5000;
@@ -47,6 +72,9 @@ static const uint32_t MQTT_PUBLISH_INTERVAL_MS = 2000;
 static const uint8_t CP_OP_START_OFFSET_COMPENSATION = 0x0C;
 static const uint8_t CP_OP_START_ENHANCED_OFFSET_COMPENSATION = 0x10;
 static const uint8_t CP_OP_RESPONSE_CODE = 0x20;
+// MYX has been observed using 0x10 as the response header.
+static const uint8_t CP_OP_MYX_RESPONSE_CODE = 0x10;
+static const uint32_t CP_FEATURE_ENHANCED_OFFSET = 1UL << 19;
 static const uint8_t CP_RESPONSE_SUCCESS = 0x01;
 static const uint8_t CP_RESPONSE_NOT_SUPPORTED = 0x02;
 static const uint8_t CP_RESPONSE_OPERATION_FAILED = 0x04;
@@ -158,6 +186,9 @@ static volatile bool connectUsingCachedAddress = false;
 static volatile bool doConnect = false;
 static volatile bool doScan = false;
 static volatile bool scanRunning = false;
+static volatile bool scanAfterDisconnect = false;
+static volatile bool disconnectPending = false;
+static volatile bool disconnectDispatchComplete = false;
 static volatile RecoveryState recoveryState = RECOVERY_IDLE;
 
 // BLE server state: what apps connect to
@@ -179,6 +210,7 @@ static bool webServerStarted = false;
 static bool apRunning = false;
 static bool routesRegistered = false;
 static bool restartPending = false;
+static bool otaComplete = false;
 static uint32_t restartAtMs = 0;
 static unsigned long lastMqttPublish = 0;
 static unsigned long lastMqttReconnectAttempt = 0;
@@ -218,18 +250,42 @@ static volatile TuneState tuneState = TUNE_IDLE;
 static volatile uint8_t tuneLastOp = 0;
 static volatile uint8_t tuneLastResponse = 0;
 static volatile int16_t tuneReportedOffset = 0;
+static volatile bool tuneOffsetReported = false;
 static volatile uint8_t tuneFailureReason = 0;
-static bool tuneRequested = false;
+static volatile bool tuneRequested = false;
+static volatile bool tuneTimedOut = false;
 static uint32_t tuneStartedMs = 0;
+static portMUX_TYPE tuneMux = portMUX_INITIALIZER_UNLOCKED;
+// Only fixed-size data is copied from BLE callbacks; formatting happens on the loop task.
+struct TuneDiagnostics {
+    int clientIf = -1;
+    uint16_t connId = 0, cpHandle = 0, cccdHandle = 0;
+    bool canWrite = false, canIndicate = false, canNotify = false;
+    bool featureValid = false;
+    uint32_t featureBits = 0;
+    bool writeSeen = false, cccdSeen = false, registrationSeen = false;
+    int writeStatus = -1, cccdStatus = -1, registrationStatus = -1;
+    uint32_t writeStartedMs = 0, writeEventMs = 0, cccdEventMs = 0;
+    uint32_t writeCount = 0, cccdCount = 0, responseCount = 0;
+    uint32_t registrationCount = 0, registrationEventMs = 0;
+    uint32_t responseMs = 0;
+    size_t responseLength = 0, responseCaptured = 0;
+    bool responseNotify = false, responseAccepted = false;
+    uint8_t responseState = 0, responseExpectedOp = 0;
+    uint8_t responseBytes[16] = {};
+};
+static TuneDiagnostics tuneDiag;
+static uint32_t loggedTuneWriteCount = 0, loggedTuneCccdCount = 0, loggedTuneResponseCount = 0, loggedTuneRegistrationCount = 0;
 
 // UI action state
 static volatile bool reconnectRequested = false;
 static volatile bool findAgainRequested = false;
-static volatile bool configPortalRequested = false;
-static uint32_t configPortalStartAtMs = 0;
 static char lastUiMessage[160] = "Booting";
 static char lastMqttTestResult[96] = "Not tested";
-static char eventLog[10][96];
+static constexpr uint8_t EVENT_LOG_CAPACITY = 64;
+static constexpr size_t EVENT_LOG_LINE = 160;
+static char eventLog[EVENT_LOG_CAPACITY][EVENT_LOG_LINE];
+static portMUX_TYPE eventLogMux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t eventLogNext = 0;
 static uint8_t eventLogCount = 0;
 
@@ -240,15 +296,36 @@ static unsigned long lastBlinkTime = 0;
 static bool ledState = false;
 
 static void scheduleRestart(const char* reason);
+static void sendNoCacheHeaders();
+
+// Allocate snapshots before locking; no I/O or allocation occurs in the critical section.
+struct EventLogSnapshot {
+    char lines[EVENT_LOG_CAPACITY][EVENT_LOG_LINE];
+    uint8_t count;
+};
+static EventLogSnapshot* snapshotEventLog() {
+    EventLogSnapshot* snapshot = (EventLogSnapshot*)malloc(sizeof(EventLogSnapshot));
+    if (!snapshot) return nullptr;
+    portENTER_CRITICAL(&eventLogMux);
+    snapshot->count = eventLogCount;
+    for (uint8_t i = 0; i < snapshot->count; ++i) {
+        uint8_t idx = (eventLogNext + EVENT_LOG_CAPACITY - eventLogCount + i) % EVENT_LOG_CAPACITY;
+        memcpy(snapshot->lines[i], eventLog[idx], EVENT_LOG_LINE);
+    }
+    portEXIT_CRITICAL(&eventLogMux);
+    return snapshot;
+}
 
 static void setUiMessage(const char* text) {
+    char line[EVENT_LOG_LINE];
+    snprintf(line, sizeof(line), "[%lu ms] %s", (unsigned long)millis(), text);
+    portENTER_CRITICAL(&eventLogMux);
     strlcpy(lastUiMessage, text, sizeof(lastUiMessage));
-    strlcpy(eventLog[eventLogNext], text, sizeof(eventLog[eventLogNext]));
-    eventLogNext = (uint8_t)((eventLogNext + 1) % 10);
-    if (eventLogCount < 10) {
-        eventLogCount++;
-    }
-    Serial.printf("[UI] %s\n", lastUiMessage);
+    strlcpy(eventLog[eventLogNext], line, sizeof(eventLog[eventLogNext]));
+    eventLogNext = (uint8_t)((eventLogNext + 1) % EVENT_LOG_CAPACITY);
+    if (eventLogCount < EVENT_LOG_CAPACITY) eventLogCount++;
+    portEXIT_CRITICAL(&eventLogMux);
+    Serial.printf("[UI] %s\n", line);
 }
 
 static const char* tuneStateText(TuneState state) {
@@ -260,7 +337,7 @@ static const char* tuneStateText(TuneState state) {
         case TUNE_SUCCESS: return "tune complete";
         case TUNE_NOT_SUPPORTED: return "sensor tune not supported";
         case TUNE_FAILED: return "sensor tune failed";
-        case TUNE_TIMEOUT: return "sensor tune timed out";
+        case TUNE_TIMEOUT: return "sensor tune timed out; reconnect sensor before retrying";
         default: return "unknown";
     }
 }
@@ -289,6 +366,49 @@ static void buildDeviceId() {
     snprintf(deviceId, sizeof(deviceId), "myx_bridge_%02x%02x%02x", mac[3], mac[4], mac[5]);
     snprintf(mqttStateTopic, sizeof(mqttStateTopic), "%s/state", deviceId);
     snprintf(mqttAvailTopic, sizeof(mqttAvailTopic), "%s/availability", deviceId);
+}
+
+static void loadAdminPassword() {
+    preferences.begin("security", true);
+    String saved = preferences.getString("user_admin", "");
+    adminConfigured = saved.length() >= 8 && saved.length() <= 63;
+    strlcpy(adminPassword, saved.c_str(), sizeof(adminPassword));
+    preferences.end();
+}
+
+static bool authorizeWeb() {
+    if (setupWindow || !adminConfigured) {
+        webServer.send(403, "text/plain", "Finish setup first");
+        return false;
+    }
+    if (!webServer.authenticate("admin", adminPassword)) {
+        webServer.requestAuthentication();
+        return false;
+    }
+    if (webServer.method() == HTTP_POST && webServer.hasHeader("Origin")) {
+        String expected = "http://" + webServer.header("Host");
+        if (webServer.header("Origin") != expected) {
+            webServer.send(403, "text/plain", "Origin rejected");
+            return false;
+        }
+    }
+    return true;
+}
+
+static String escapeHtml(const char* input) {
+    String result;
+    while (*input) {
+        switch (*input) {
+            case '&': result += "&amp;"; break;
+            case '<': result += "&lt;"; break;
+            case '>': result += "&gt;"; break;
+            case '\'': result += "&#39;"; break;
+            case '"': result += "&quot;"; break;
+            default: result += *input;
+        }
+        ++input;
+    }
+    return result;
 }
 
 static void loadCalibration() {
@@ -432,69 +552,6 @@ static void clearCachedSensor() {
     cachedSensor = defaultCachedSensorConfig();
 }
 
-static void runWiFiManagerPortal() {
-    setUiMessage("Starting WiFiManager setup portal");
-    Serial.printf("[WIFI] Starting WiFiManager portal: %s\n", AP_NAME);
-
-    if (webServerStarted) {
-        webServer.stop();
-        webServerStarted = false;
-    }
-    if (apRunning) {
-        WiFi.softAPdisconnect(true);
-        apRunning = false;
-    }
-
-    char mqttEnabledValue[2];
-    snprintf(mqttEnabledValue, sizeof(mqttEnabledValue), "%d", mqttConfig.enabled ? 1 : 0);
-    char mqttPortValue[6];
-    snprintf(mqttPortValue, sizeof(mqttPortValue), "%u", (unsigned int)mqttConfig.port);
-
-    WiFiManager wm;
-    WiFiManagerParameter mqttHeader("<br><h3>MQTT Settings</h3>");
-    WiFiManagerParameter mqttEnabledParam("mqtt_enabled", "MQTT Enabled (1 or 0)", mqttEnabledValue, 1);
-    WiFiManagerParameter mqttHostParam("mqtt_host", "MQTT Host", mqttConfig.host, 63);
-    WiFiManagerParameter mqttPortParam("mqtt_port", "MQTT Port", mqttPortValue, 5);
-    WiFiManagerParameter mqttUserParam("mqtt_user", "MQTT Username", mqttConfig.user, 31);
-    WiFiManagerParameter mqttPassParam("mqtt_pass", "MQTT Password", mqttConfig.pass, 63);
-
-    wm.addParameter(&mqttHeader);
-    wm.addParameter(&mqttEnabledParam);
-    wm.addParameter(&mqttHostParam);
-    wm.addParameter(&mqttPortParam);
-    wm.addParameter(&mqttUserParam);
-    wm.addParameter(&mqttPassParam);
-    wm.setConfigPortalTimeout(300);
-    wm.setConnectTimeout(20);
-    wm.setBreakAfterConfig(true);
-
-    bool ok = wm.startConfigPortal(AP_NAME);
-    if (ok || WiFi.status() == WL_CONNECTED) {
-        String ssid = WiFi.SSID();
-        String pass = WiFi.psk();
-        wifiConfig.provisioned = ssid.length() > 0;
-        strlcpy(wifiConfig.ssid, ssid.c_str(), sizeof(wifiConfig.ssid));
-        strlcpy(wifiConfig.password, pass.c_str(), sizeof(wifiConfig.password));
-        saveWiFiConfig();
-
-        mqttConfig.enabled = atoi(mqttEnabledParam.getValue()) != 0;
-        strlcpy(mqttConfig.host, mqttHostParam.getValue(), sizeof(mqttConfig.host));
-        mqttConfig.port = (uint16_t)atoi(mqttPortParam.getValue());
-        if (mqttConfig.port == 0) mqttConfig.port = MQTT_DEFAULT_PORT;
-        strlcpy(mqttConfig.user, mqttUserParam.getValue(), sizeof(mqttConfig.user));
-        strlcpy(mqttConfig.pass, mqttPassParam.getValue(), sizeof(mqttConfig.pass));
-        if (strlen(mqttConfig.host) == 0) mqttConfig.enabled = false;
-        saveMqttConfig();
-
-        Serial.printf("[WIFI] WiFiManager saved SSID '%s'; MQTT %s\n",
-                      wifiConfig.ssid, mqttConfig.enabled ? "enabled" : "disabled");
-        scheduleRestart("Network setup saved, restarting");
-    } else {
-        Serial.println("[WIFI] WiFiManager portal closed without connection");
-        scheduleRestart("Network setup closed, restarting");
-    }
-}
-
 static void fullReset() {
     clearWiFiConfig();
     clearMqttConfig();
@@ -584,10 +641,9 @@ static void cleanupSensorDevice() {
 static void cleanupBleClient() {
     if (bleClient != nullptr) {
         if (bleClient->isConnected()) {
+            disconnectPending = true;
             bleClient->disconnect();
         }
-        delete bleClient;
-        bleClient = nullptr;
     }
     remoteControlPointReady = false;
     remotePowerControlPoint = nullptr;
@@ -630,9 +686,9 @@ static void stopAccessPoint() {
 }
 
 static void startAccessPointIfNeeded() {
-    if (wifiConfig.provisioned || apRunning || !sensorConnected) return;
-    WiFi.mode(WIFI_AP);
-    bool apStarted = strlen(AP_PASS) > 0 ? WiFi.softAP(AP_NAME, AP_PASS) : WiFi.softAP(AP_NAME);
+    if (apRunning || (!setupWindow && (!adminConfigured || (!wifiConfig.provisioned && !sensorConnected)))) return;
+    WiFi.mode(wifiConfig.provisioned ? WIFI_AP_STA : WIFI_AP);
+    bool apStarted = setupWindow ? WiFi.softAP(AP_NAME) : WiFi.softAP(AP_NAME, adminPassword);
     if (apStarted) {
         apRunning = true;
         if (!webServerStarted) {
@@ -647,9 +703,71 @@ static void startAccessPointIfNeeded() {
     }
 }
 
+static void openSetupWindow() {
+    if (apRunning) stopAccessPoint();
+    setupCommitted = false;
+    snprintf(setupToken, sizeof(setupToken), "%08lx%08lx%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random(), (unsigned long)esp_random(), (unsigned long)esp_random());
+    setupWindow = true;
+    setupStarted = millis();
+    startAccessPointIfNeeded();
+}
+
+static bool setupRequestAllowed() {
+    return setupWindow && !setupCommitted && millis() - setupStarted < 600000 && apRunning && webServer.client().localIP() == WiFi.softAPIP();
+}
+
+static void handleSetupPage() {
+    if (!setupRequestAllowed()) { webServer.send(403, "text/plain", "Setup is only available on the setup network"); return; }
+    String page = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>MYX Bridge setup</title><style>body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#e0e0e0;max-width:520px;margin:auto;padding:24px}h1{color:#00d4ff}form{background:#16213e;padding:20px;border-radius:12px}label{display:block;margin:16px 0;color:#cbd5e1}input{display:block;box-sizing:border-box;width:100%;padding:12px;margin-top:6px;border:1px solid #52637b;border-radius:6px;font-size:16px}button{background:#533483;color:white;border:0;border-radius:6px;padding:14px;font-size:16px;width:100%}</style></head><body><h1>MYX Bridge setup</h1><p>Choose an administrator password. You can optionally configure Wi-Fi now.</p><form method='post' action='/setup'><input type='hidden' name='token' value='";
+    page += setupToken;
+    page += "'><label>New password (8 to 63 characters) <input type='password' name='admin' minlength='8' maxlength='63' required></label><label>Confirm password <input type='password' name='confirm' minlength='8' maxlength='63' required></label><p>Leave the network name blank to keep existing Wi-Fi settings. If you enter a network name, leave its password blank only for an open network.</p><label>Wi-Fi network name (optional) <input name='ssid' maxlength='32'></label><label>Wi-Fi password <input type='password' name='wifi_password' maxlength='64'></label><button type='submit'>Save and restart</button></form></body></html>";
+    sendNoCacheHeaders();
+    webServer.send(200, "text/html", page);
+}
+
+static void handleSetupPost() {
+    if (!setupRequestAllowed() || !webServer.hasArg("token") || webServer.arg("token") != setupToken ||
+        (webServer.hasHeader("Origin") && webServer.header("Origin") != "http://" + webServer.header("Host"))) {
+        webServer.send(403, "text/plain", "Setup request rejected"); return;
+    }
+    String pass = webServer.arg("admin");
+    String ssid = webServer.arg("ssid");
+    String wifiPass = webServer.arg("wifi_password");
+    if (pass.length() < 8 || pass.length() > 63 || pass != webServer.arg("confirm") || ssid.length() > 32 || wifiPass.length() > 64) {
+        webServer.send(400, "text/plain", "Check the passwords and Wi-Fi settings, then return and try again."); return;
+    }
+    for (size_t i = 0; i < pass.length(); ++i) {
+        if ((uint8_t)pass[i] < 32 || (uint8_t)pass[i] > 126) {
+            webServer.send(400, "text/plain", "Use printable ASCII characters for the password."); return;
+        }
+    }
+    if (ssid.length()) {
+        nvs_handle_t handle;
+        if (nvs_open("wifi", NVS_READWRITE, &handle) != ESP_OK) { webServer.send(500, "text/plain", "Could not save Wi-Fi; try again."); return; }
+        bool wifiSaved = nvs_set_str(handle, "ssid", ssid.c_str()) == ESP_OK &&
+                         nvs_set_str(handle, "pass", wifiPass.c_str()) == ESP_OK &&
+                         nvs_set_u8(handle, "provisioned", 1) == ESP_OK &&
+                         nvs_commit(handle) == ESP_OK;
+        nvs_close(handle);
+        if (!wifiSaved) { webServer.send(500, "text/plain", "Could not save Wi-Fi; try again."); return; }
+        strlcpy(wifiConfig.ssid, ssid.c_str(), sizeof(wifiConfig.ssid));
+        strlcpy(wifiConfig.password, wifiPass.c_str(), sizeof(wifiConfig.password));
+        wifiConfig.provisioned = true;
+    }
+    if (!preferences.begin("security", false)) { webServer.send(500, "text/plain", "Could not save password; try again."); return; }
+    bool saved = preferences.putString("user_admin", pass) == pass.length();
+    preferences.end();
+    if (!saved) { webServer.send(500, "text/plain", "Could not save password; try again."); return; }
+    strlcpy(adminPassword, pass.c_str(), sizeof(adminPassword));
+    adminConfigured = true;
+    setupCommitted = true;
+    webServer.send(200, "text/html", "<p>Settings saved. The bridge is restarting. Reconnect to your Wi-Fi network, or to MYX-Bridge-Setup using your new password, then sign in as admin.</p>");
+    scheduleRestart("Setup complete, restarting");
+}
+
 static void beginWiFiConnect() {
     if (!wifiConfig.provisioned) return;
-    WiFi.mode(WIFI_STA);
+    WiFi.mode(apRunning ? WIFI_AP_STA : WIFI_STA);
     WiFi.begin(wifiConfig.ssid, wifiConfig.password);
     wifiConnectInProgress = true;
     wifiConnectStartedAt = millis();
@@ -659,6 +777,7 @@ static void beginWiFiConnect() {
 }
 
 static void ensureWiFiState() {
+    if (setupWindow) return;
     if (!wifiConfig.provisioned) {
         if (WiFi.getMode() != WIFI_OFF && !apRunning) {
             WiFi.mode(WIFI_OFF);
@@ -666,12 +785,9 @@ static void ensureWiFiState() {
         return;
     }
 
-    if (apRunning) {
-        stopAccessPoint();
-    }
-
     wl_status_t status = WiFi.status();
     if (status == WL_CONNECTED) {
+        if (apRunning) stopAccessPoint();
         if (wifiConnectInProgress) {
             wifiConnectInProgress = false;
             setUiMessage("WiFi connected");
@@ -693,51 +809,100 @@ static void ensureWiFiState() {
         wifiConnectInProgress = false;
         WiFi.disconnect();
         setUiMessage("WiFi connect timed out, retrying");
+        startAccessPointIfNeeded();
     }
 }
 
 static bool writeSensorTuneOp(uint8_t opCode, TuneState waitingState) {
-    if (!remoteControlPointReady || remotePowerControlPoint == nullptr) {
+    BLERemoteCharacteristic* controlPoint = remotePowerControlPoint;
+    if (!sensorConnected || !remoteControlPointReady || controlPoint == nullptr) {
         tuneState = TUNE_NO_CONTROL_POINT;
         Serial.println("[TUNE] Sensor Cycling Power Control Point unavailable");
         return false;
     }
 
     uint8_t payload[1] = {opCode};
+    portENTER_CRITICAL(&tuneMux);
+    if (!sensorConnected || !remoteControlPointReady) {
+        portEXIT_CRITICAL(&tuneMux);
+        return false;
+    }
     tuneLastOp = opCode;
     tuneLastResponse = 0;
     tuneReportedOffset = 0;
+    tuneOffsetReported = false;
     tuneFailureReason = 0;
     tuneState = waitingState;
     tuneStartedMs = millis();
-    remotePowerControlPoint->writeValue(payload, sizeof(payload), true);
-    Serial.printf("[TUNE] Sent sensor tune op 0x%02X\n", opCode);
+    tuneDiag.writeStartedMs = tuneStartedMs;
+    tuneDiag.writeSeen = false;
+    tuneDiag.writeStatus = -1;
+    portEXIT_CRITICAL(&tuneMux);
+    // Client destruction is deferred until the disconnect event has completed.
+    controlPoint->writeValue(payload, sizeof(payload), true);
+    Serial.printf("[TUNE] Requested sensor tune op 0x%02X\n", opCode);
     return true;
 }
 
 static void serviceTuneState() {
+    TuneDiagnostics snapshot;
+    portENTER_CRITICAL(&tuneMux);
+    snapshot = tuneDiag;
+    if ((snapshot.cccdSeen && snapshot.cccdStatus != ESP_GATT_OK) ||
+        (snapshot.registrationSeen && snapshot.registrationStatus != ESP_GATT_OK)) remoteControlPointReady = false;
+    if (snapshot.writeSeen && snapshot.writeStatus != ESP_GATT_OK &&
+        (tuneState == TUNE_STANDARD_SENT || tuneState == TUNE_ENHANCED_SENT)) {
+        tuneState = TUNE_FAILED;
+    }
+    portEXIT_CRITICAL(&tuneMux);
+    char detail[96];
+    if (snapshot.cccdCount != loggedTuneCccdCount) {
+        loggedTuneCccdCount = snapshot.cccdCount;
+        snprintf(detail, sizeof(detail), "Tune CCCD write status 0x%02X at %lu ms", snapshot.cccdStatus, (unsigned long)snapshot.cccdEventMs);
+        setUiMessage(detail);
+    }
+    if (snapshot.registrationCount != loggedTuneRegistrationCount) {
+        loggedTuneRegistrationCount = snapshot.registrationCount;
+        snprintf(detail, sizeof(detail), "Tune notification registration status 0x%02X at %lu ms", snapshot.registrationStatus, (unsigned long)snapshot.registrationEventMs);
+        setUiMessage(detail);
+    }
+    if (snapshot.writeCount != loggedTuneWriteCount) {
+        loggedTuneWriteCount = snapshot.writeCount;
+        snprintf(detail, sizeof(detail), "Tune op 0x%02X write status 0x%02X at %lu ms", (unsigned)tuneLastOp, snapshot.writeStatus, (unsigned long)snapshot.writeEventMs);
+        setUiMessage(detail);
+    }
+    if (snapshot.responseCount != loggedTuneResponseCount) {
+        loggedTuneResponseCount = snapshot.responseCount;
+        snprintf(detail, sizeof(detail), "Tune response %s len %u code 0x%02X at %lu ms", snapshot.responseAccepted ? "accepted" : "ignored", (unsigned)snapshot.responseLength, snapshot.responseCaptured >= 3 ? snapshot.responseBytes[2] : 0, (unsigned long)snapshot.responseMs);
+        setUiMessage(detail);
+    }
     if (tuneRequested) {
         tuneRequested = false;
-        writeSensorTuneOp(CP_OP_START_OFFSET_COMPENSATION, TUNE_STANDARD_SENT);
-    }
-
-    if ((tuneState == TUNE_STANDARD_SENT || tuneState == TUNE_ENHANCED_SENT) &&
-        millis() - tuneStartedMs > TUNE_TIMEOUT_MS) {
-        if (tuneState == TUNE_STANDARD_SENT) {
-            setUiMessage("Standard tune timed out, trying enhanced tune");
-            Serial.println("[TUNE] Standard tune timed out; trying enhanced tune");
+        // Prefer enhanced only when the sensor advertises it. Otherwise try
+        // standard offset, including when the feature characteristic is absent.
+        if (snapshot.featureValid && (snapshot.featureBits & CP_FEATURE_ENHANCED_OFFSET))
             writeSensorTuneOp(CP_OP_START_ENHANCED_OFFSET_COMPENSATION, TUNE_ENHANCED_SENT);
-        } else {
-            tuneState = TUNE_TIMEOUT;
-            setUiMessage("Sensor tune timed out");
-            Serial.println("[TUNE] Enhanced tune timed out");
-        }
+        else
+            writeSensorTuneOp(CP_OP_START_OFFSET_COMPENSATION, TUNE_STANDARD_SENT);
     }
 
-    if (tuneState == TUNE_NOT_SUPPORTED && tuneLastOp == CP_OP_START_OFFSET_COMPENSATION) {
-        setUiMessage("Standard tune unsupported, trying enhanced tune");
-        Serial.println("[TUNE] Standard tune unsupported; trying enhanced tune");
-        writeSensorTuneOp(CP_OP_START_ENHANCED_OFFSET_COMPENSATION, TUNE_ENHANCED_SENT);
+    portENTER_CRITICAL(&tuneMux);
+    bool tuneExpired = (tuneState == TUNE_STANDARD_SENT || tuneState == TUNE_ENHANCED_SENT) &&
+        millis() - tuneStartedMs >= TUNE_TIMEOUT_MS;
+    if (tuneExpired) {
+        tuneState = TUNE_TIMEOUT;
+        tuneTimedOut = true;
+    }
+    portEXIT_CRITICAL(&tuneMux);
+    if (tuneExpired) {
+        setUiMessage("Sensor tune timed out");
+        Serial.println("[TUNE] Sensor tune timed out");
+    }
+
+    if (tuneState == TUNE_NOT_SUPPORTED && tuneLastOp == CP_OP_START_ENHANCED_OFFSET_COMPENSATION) {
+        setUiMessage("Enhanced tune unsupported, trying standard tune");
+        Serial.println("[TUNE] Enhanced tune unsupported; trying standard tune");
+        writeSensorTuneOp(CP_OP_START_OFFSET_COMPENSATION, TUNE_STANDARD_SENT);
     }
 }
 
@@ -778,34 +943,80 @@ static void remoteControlPointCallback(
     bool isNotify)
 {
     (void)pChar;
-    (void)isNotify;
-    if (length < 3 || pData[0] != CP_OP_RESPONSE_CODE) return;
+    Serial.printf("[TUNE] %s received (%u bytes):", isNotify ? "Notification" : "Indication", (unsigned)length);
+    for (size_t i = 0; i < length && i < 16; ++i) Serial.printf(" %02X", pData[i]);
+    if (length > 16) Serial.print(" ...");
+    Serial.println();
+    portENTER_CRITICAL(&tuneMux);
+    // Accept only the two observed forms using the nonstandard MYX header.
+    bool myxUnsupported = length == 3 && pData[0] == CP_OP_MYX_RESPONSE_CODE &&
+        pData[1] == CP_OP_START_ENHANCED_OFFSET_COMPENSATION &&
+        pData[2] == CP_RESPONSE_NOT_SUPPORTED;
+    bool myxStandardSuccess = length == 3 && pData[0] == CP_OP_MYX_RESPONSE_CODE &&
+        pData[1] == CP_OP_START_OFFSET_COMPENSATION &&
+        pData[2] == CP_RESPONSE_SUCCESS;
+    bool accepted = length >= 3 &&
+        (pData[0] == CP_OP_RESPONSE_CODE || myxUnsupported || myxStandardSuccess) &&
+        (tuneState == TUNE_STANDARD_SENT || tuneState == TUNE_ENHANCED_SENT) &&
+        pData[1] == tuneLastOp && pData[2] >= CP_RESPONSE_SUCCESS &&
+        pData[2] <= CP_RESPONSE_OPERATION_FAILED;
+    tuneDiag.responseCount++;
+    tuneDiag.responseMs = millis();
+    tuneDiag.responseLength = length;
+    tuneDiag.responseCaptured = length < sizeof(tuneDiag.responseBytes) ? length : sizeof(tuneDiag.responseBytes);
+    memcpy(tuneDiag.responseBytes, pData, tuneDiag.responseCaptured);
+    tuneDiag.responseNotify = isNotify;
+    tuneDiag.responseAccepted = accepted;
+    tuneDiag.responseState = (uint8_t)tuneState;
+    tuneDiag.responseExpectedOp = tuneLastOp;
+    if (!accepted) {
+        portEXIT_CRITICAL(&tuneMux);
+        Serial.printf("[TUNE] Ignored response (state %u, expected op 0x%02X)\n", (unsigned)tuneState, tuneLastOp);
+        return;
+    }
 
     tuneLastOp = pData[1];
     tuneLastResponse = pData[2];
     tuneFailureReason = 0;
     tuneReportedOffset = 0;
+    tuneOffsetReported = false;
 
-    if (length >= 5) {
-        tuneReportedOffset = (int16_t)(pData[3] | (pData[4] << 8));
-    } else if (length >= 4) {
+    if (tuneLastResponse == CP_RESPONSE_OPERATION_FAILED && length >= 4) {
         tuneFailureReason = pData[3];
     }
 
-    if (tuneLastResponse == CP_RESPONSE_SUCCESS) {
+    // Enhanced success includes company ID and a length-prefixed manufacturer payload.
+    bool malformedSuccess = tuneLastResponse == CP_RESPONSE_SUCCESS &&
+        ((tuneLastOp == CP_OP_START_OFFSET_COMPENSATION && length != 5 && !myxStandardSuccess) ||
+        (tuneLastOp == CP_OP_START_ENHANCED_OFFSET_COMPENSATION &&
+        (length < 8 || length != (size_t)8 + pData[7])));
+    if (tuneLastResponse == CP_RESPONSE_SUCCESS && !malformedSuccess) {
+        if (!myxStandardSuccess) {
+            tuneReportedOffset = (int16_t)(pData[3] | (pData[4] << 8));
+            tuneOffsetReported = true;
+        }
         tuneState = TUNE_SUCCESS;
-        setUiMessage("Sensor tune complete");
-        Serial.printf("[TUNE] Sensor tune complete. Offset result: %d\n", tuneReportedOffset);
     } else if (tuneLastResponse == CP_RESPONSE_NOT_SUPPORTED) {
         tuneState = TUNE_NOT_SUPPORTED;
+    } else {
+        tuneState = TUNE_FAILED;
+    }
+    portEXIT_CRITICAL(&tuneMux);
+
+    if (malformedSuccess) {
+        setUiMessage("Sensor tune returned a malformed success response");
+        Serial.println("[TUNE] Success response has invalid result length");
+    } else if (tuneLastResponse == CP_RESPONSE_SUCCESS) {
+        setUiMessage("Sensor tune complete");
+        if (tuneOffsetReported) Serial.printf("[TUNE] Sensor tune complete. Offset result: %d\n", tuneReportedOffset);
+        else Serial.println("[TUNE] Sensor tune complete. Offset not reported");
+    } else if (tuneLastResponse == CP_RESPONSE_NOT_SUPPORTED) {
         setUiMessage("Sensor tune opcode not supported");
         Serial.printf("[TUNE] Sensor rejected op 0x%02X as not supported\n", tuneLastOp);
     } else if (tuneLastResponse == CP_RESPONSE_OPERATION_FAILED) {
-        tuneState = TUNE_FAILED;
         setUiMessage("Sensor tune failed");
         Serial.printf("[TUNE] Sensor tune failed for op 0x%02X, reason 0x%02X\n", tuneLastOp, tuneFailureReason);
     } else {
-        tuneState = TUNE_FAILED;
         setUiMessage("Sensor tune returned an unknown response");
         Serial.printf("[TUNE] Sensor tune response for op 0x%02X: 0x%02X\n", tuneLastOp, tuneLastResponse);
     }
@@ -986,17 +1197,66 @@ class SensorClientCallbacks : public BLEClientCallbacks {
 
     void onDisconnect(BLEClient* pclient) override {
         (void)pclient;
+        disconnectPending = true;
         Serial.println("[SENSOR] Disconnected from power meter!");
         sensorConnected = false;
+        lastBroadcastPower = 0;
+        lastCorrectedPower = 0;
+        lastCadence = 0;
+        lastSensorPacketMs = 0;
+        smoothedPower = 0;
         remoteControlPointReady = false;
         remotePowerControlPoint = nullptr;
+        portENTER_CRITICAL(&tuneMux);
+        tuneRequested = false;
         tuneState = TUNE_IDLE;
-        if (!wifiConfig.provisioned) {
+        tuneTimedOut = false;
+        portEXIT_CRITICAL(&tuneMux);
+        if (!wifiConfig.provisioned && !setupWindow) {
             stopAccessPoint();
         }
-        requestSensorRecovery(true, "Sensor disconnected, recovering");
+        bool preferCached = !scanAfterDisconnect;
+        scanAfterDisconnect = false;
+        requestSensorRecovery(preferCached, "Sensor disconnected, recovering");
     }
 };
+
+// The library invokes this hook only after its client and service event dispatch
+// has completed. Reclaim the client on the loop task after this point.
+static void onGattClientEventComplete(esp_gattc_cb_event_t event, esp_gatt_if_t clientIf,
+                                      esp_ble_gattc_cb_param_t* param) {
+    if (param && event == ESP_GATTC_REG_FOR_NOTIFY_EVT) {
+        portENTER_CRITICAL(&tuneMux);
+        if ((int)clientIf == tuneDiag.clientIf && tuneDiag.cpHandle && param->reg_for_notify.handle == tuneDiag.cpHandle) {
+            tuneDiag.registrationSeen = true;
+            tuneDiag.registrationStatus = param->reg_for_notify.status;
+            tuneDiag.registrationEventMs = millis();
+            tuneDiag.registrationCount++;
+        }
+        portEXIT_CRITICAL(&tuneMux);
+    }
+    if (param && (event == ESP_GATTC_WRITE_CHAR_EVT || event == ESP_GATTC_WRITE_DESCR_EVT)) {
+        portENTER_CRITICAL(&tuneMux);
+        if ((int)clientIf == tuneDiag.clientIf && param->write.conn_id == tuneDiag.connId) {
+            if (event == ESP_GATTC_WRITE_CHAR_EVT && tuneDiag.cpHandle && param->write.handle == tuneDiag.cpHandle) {
+                tuneDiag.writeSeen = true;
+                tuneDiag.writeStatus = param->write.status;
+                tuneDiag.writeEventMs = millis();
+                tuneDiag.writeCount++;
+            } else if (event == ESP_GATTC_WRITE_DESCR_EVT && tuneDiag.cccdHandle && param->write.handle == tuneDiag.cccdHandle) {
+                tuneDiag.cccdSeen = true;
+                tuneDiag.cccdStatus = param->write.status;
+                tuneDiag.cccdEventMs = millis();
+                tuneDiag.cccdCount++;
+            }
+        }
+        portEXIT_CRITICAL(&tuneMux);
+    }
+    if (event == ESP_GATTC_DISCONNECT_EVT && disconnectPending) {
+        disconnectDispatchComplete = true;
+        disconnectPending = false;
+    }
+}
 
 class SensorScanCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) override {
@@ -1012,7 +1272,7 @@ class SensorScanCallbacks : public BLEAdvertisedDeviceCallbacks {
         bool cachedMatch = cachedSensor.valid &&
             strcmp(advertisedDevice.getAddress().toString().c_str(), cachedSensor.address) == 0;
 
-        if (!hasCPS && !nameMatch && !cachedMatch) return;
+        if (!nameMatch && !cachedMatch) return;
 
         Serial.printf("[SCAN] Candidate sensor: '%s' (%s)\n",
                       devName.c_str(),
@@ -1046,10 +1306,17 @@ static bool connectToSensor() {
     if (sensorConnected) return true;
 
     stopBleScan();
-    cleanupBleClient();
-
-    bleClient = BLEDevice::createClient();
-    bleClient->setClientCallbacks(new SensorClientCallbacks());
+    if (disconnectPending) return false;
+    if (disconnectDispatchComplete) {
+        delete bleClient;
+        bleClient = nullptr;
+        disconnectDispatchComplete = false;
+    }
+    if (bleClient == nullptr) {
+        static SensorClientCallbacks callbacks;
+        bleClient = BLEDevice::createClient();
+        bleClient->setClientCallbacks(&callbacks);
+    }
 
     bool connected = false;
     if (connectUsingCachedAddress && cachedSensor.valid && strlen(cachedSensor.address) > 0) {
@@ -1089,12 +1356,40 @@ static bool connectToSensor() {
         Serial.println("[SENSOR] Subscribed to power notifications");
     } else {
         Serial.println("[SENSOR] WARNING: measurement characteristic does not notify");
+        cleanupBleClient();
+        return false;
     }
 
     remotePowerControlPoint = remoteService->getCharacteristic(CPS_CONTROL_POINT_UUID);
     remoteControlPointReady = false;
+    portENTER_CRITICAL(&tuneMux);
+    tuneDiag.clientIf = (int)bleClient->getGattcIf();
+    tuneDiag.connId = bleClient->getConnId();
+    tuneDiag.cpHandle = 0;
+    tuneDiag.cccdHandle = 0;
+    tuneDiag.cccdSeen = false;
+    tuneDiag.cccdStatus = -1;
+    tuneDiag.writeSeen = false;
+    tuneDiag.writeStatus = -1;
+    tuneDiag.registrationSeen = false;
+    tuneDiag.registrationStatus = -1;
+    tuneDiag.featureValid = false;
+    tuneDiag.canWrite = tuneDiag.canIndicate = tuneDiag.canNotify = false;
+    portEXIT_CRITICAL(&tuneMux);
     if (remotePowerControlPoint != nullptr) {
-        if (remotePowerControlPoint->canIndicate()) {
+        BLERemoteDescriptor* cpCccd = remotePowerControlPoint->getDescriptor(BLEUUID((uint16_t)0x2902));
+        portENTER_CRITICAL(&tuneMux);
+        tuneDiag.cpHandle = remotePowerControlPoint->getHandle();
+        tuneDiag.cccdHandle = cpCccd ? cpCccd->getHandle() : 0;
+        tuneDiag.canWrite = remotePowerControlPoint->canWrite();
+        tuneDiag.canIndicate = remotePowerControlPoint->canIndicate();
+        tuneDiag.canNotify = remotePowerControlPoint->canNotify();
+        portEXIT_CRITICAL(&tuneMux);
+        if (!remotePowerControlPoint->canWrite()) {
+            Serial.println("[TUNE] Remote Cycling Power Control Point does not support write with response");
+        } else if (cpCccd == nullptr) {
+            Serial.println("[TUNE] Remote Cycling Power Control Point has no client configuration descriptor");
+        } else if (remotePowerControlPoint->canIndicate()) {
             remotePowerControlPoint->registerForNotify(remoteControlPointCallback, false);
             remoteControlPointReady = true;
             Serial.println("[TUNE] Remote Cycling Power Control Point found with indications");
@@ -1107,8 +1402,8 @@ static bool connectToSensor() {
         }
     } else {
         Serial.println("[TUNE] Remote Cycling Power Control Point not found");
-        tuneState = TUNE_NO_CONTROL_POINT;
     }
+    if (!remoteControlPointReady) tuneState = TUNE_NO_CONTROL_POINT;
 
     BLERemoteCharacteristic* remoteLocation = remoteService->getCharacteristic(SENSOR_LOCATION_UUID);
     if (remoteLocation != nullptr && remoteLocation->canRead()) {
@@ -1121,6 +1416,14 @@ static bool connectToSensor() {
     BLERemoteCharacteristic* remoteFeature = remoteService->getCharacteristic(CPS_FEATURE_UUID);
     if (remoteFeature != nullptr && remoteFeature->canRead()) {
         std::string featVal = remoteFeature->readValue();
+        if (featVal.length() >= 4) {
+            uint32_t bits = (uint8_t)featVal[0] | ((uint32_t)(uint8_t)featVal[1] << 8) |
+                            ((uint32_t)(uint8_t)featVal[2] << 16) | ((uint32_t)(uint8_t)featVal[3] << 24);
+            portENTER_CRITICAL(&tuneMux);
+            tuneDiag.featureBits = bits;
+            tuneDiag.featureValid = true;
+            portEXIT_CRITICAL(&tuneMux);
+        }
         Serial.print("[SENSOR] Feature value: ");
         for (size_t i = 0; i < featVal.length(); i++) {
             Serial.printf("%02X ", (uint8_t)featVal[i]);
@@ -1150,12 +1453,13 @@ static bool connectToSensor() {
         }
     }
 
-    const char* connectedName = sensorDevice != nullptr ? sensorDevice->getName().c_str() : cachedSensor.lastName;
+    std::string connectedName = sensorDevice != nullptr ? sensorDevice->getName() : std::string(cachedSensor.lastName);
     saveCachedSensor(bleClient->getPeerAddress(),
                      sensorDevice != nullptr ? sensorDevice->getAddressType() : (esp_ble_addr_type_t)cachedSensor.addrType,
-                     connectedName);
+                     connectedName.c_str());
 
     lastCrankMoveMs = millis();
+    lastSensorPacketMs = millis();
     sensorConnected = true;
     recoveryState = RECOVERY_CONNECTED;
     publishSensorData();
@@ -1304,9 +1608,9 @@ static void publishDiscovery() {
         char topic[128];
         snprintf(topic, sizeof(topic), "%s/sensor/%s/config", MQTT_DISCOVERY_PREFIX, uid);
 
-        char payload[512];
-        serializeJson(doc, payload, sizeof(payload));
-        mqttClient.publish(topic, payload, true);
+        String payload;
+        serializeJson(doc, payload);
+        if (!mqttClient.publish(topic, payload.c_str(), true)) Serial.println("[MQTT] Discovery publish failed");
     }
 
     JsonDocument doc;
@@ -1333,9 +1637,9 @@ static void publishDiscovery() {
     char topic[128];
     snprintf(topic, sizeof(topic), "%s/binary_sensor/%s/config", MQTT_DISCOVERY_PREFIX, uid);
 
-    char payload[512];
-    serializeJson(doc, payload, sizeof(payload));
-    mqttClient.publish(topic, payload, true);
+    String payload;
+    serializeJson(doc, payload);
+    if (!mqttClient.publish(topic, payload.c_str(), true)) Serial.println("[MQTT] Discovery publish failed");
 }
 
 static void publishSensorData() {
@@ -1344,7 +1648,8 @@ static void publishSensorData() {
     JsonDocument doc;
     doc["power"] = (int)lastBroadcastPower;
     doc["cadence"] = round(lastCadence * 10.0f) / 10.0f;
-    doc["battery"] = (lastBattery == 0xFF) ? 0 : (int)lastBattery;
+    if (lastBattery == 0xFF) doc["battery"] = nullptr;
+    else doc["battery"] = (int)lastBattery;
     doc["energy"] = (int)lastEnergy;
     doc["ble_connected"] = sensorConnected ? "ON" : "OFF";
 
@@ -1493,15 +1798,22 @@ static void sendPageEnd() {
     webServer.sendContent("");
 }
 
+static void mqttDisconnectCleanly() {
+    if (mqttClient.connected()) {
+        mqttClient.publish(mqttAvailTopic, "offline", true);
+        mqttClient.disconnect();
+    }
+}
+
 static void ensureMqttState() {
     if (!mqttConfigured || !mqttConfig.enabled) {
-        if (mqttClient.connected()) mqttClient.disconnect();
+        mqttDisconnectCleanly();
         mqttConnected = false;
         return;
     }
 
     if (WiFi.status() != WL_CONNECTED) {
-        if (mqttClient.connected()) mqttClient.disconnect();
+        mqttDisconnectCleanly();
         mqttConnected = false;
         return;
     }
@@ -1559,7 +1871,7 @@ static void handleWebRoot() {
         ".online{color:#00ff88}.offline{color:#ff4444}"
         ".note{color:#9aa3b4;font-size:.95em;line-height:1.45;margin:0 0 10px}"
         ".btn{display:block;width:100%;padding:12px;margin:12px 0 0;background:#533483;color:#fff;border:none;border-radius:8px;font-size:1em;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box}"
-        ".btn:hover{background:#6c44a0}"
+        ".btn:hover{background:#6c44a0}.btn:disabled{opacity:.5;cursor:not-allowed}"
         ".btn-secondary{background:#0f3460}.btn-secondary:hover{background:#1a4a7a}"
         ".btn-danger{background:#c0392b}.btn-danger:hover{background:#e74c3c}"
         ".btn-row{display:grid;grid-template-columns:1fr;gap:10px;margin-top:10px}"
@@ -1607,7 +1919,9 @@ static void handleWebRoot() {
     webServer.sendContent(buf);
     snprintf(buf, sizeof(buf), "<div class='row'><span class='label'>WiFi</span><span class='value %s' id='val-wifi'>%s</span></div>",
              WiFi.status() == WL_CONNECTED ? "online" : "offline",
-             wifiStatusText().c_str());
+             (WiFi.status() == WL_CONNECTED ? "Connected" : (wifiConfig.provisioned ? "Waiting" : "Not provisioned")));
+    webServer.sendContent(buf);
+    snprintf(buf, sizeof(buf), "<div class='row'><span class='label'>IP Address</span><span class='value' id='val-wifi-ip'>%s</span></div>", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "?");
     webServer.sendContent(buf);
     snprintf(buf, sizeof(buf), "<div class='row'><span class='label'>MQTT</span><span class='value %s' id='val-mqtt'>%s</span></div>",
              mqttConnected ? "online" : "offline",
@@ -1615,7 +1929,7 @@ static void handleWebRoot() {
     webServer.sendContent(buf);
     if (mqttConfig.enabled && strlen(mqttConfig.host) > 0) {
         snprintf(buf, sizeof(buf), "<div class='row'><span class='label'>MQTT Broker</span><span class='value' id='val-broker'>%s:%u</span></div>",
-                 mqttConfig.host, (unsigned int)mqttConfig.port);
+                 escapeHtml(mqttConfig.host).c_str(), (unsigned int)mqttConfig.port);
         webServer.sendContent(buf);
     }
     webServer.sendContent("</div>");
@@ -1623,7 +1937,10 @@ static void handleWebRoot() {
     webServer.sendContent("<div class='card'><h2>Calibrate Sensor</h2><p class='note'>Pedal to wake the sensor, get off the bike, set the crank vertical, then run tune.</p>");
     snprintf(buf, sizeof(buf), "<div class='row'><span class='label'>Tune Status</span><span class='value' id='val-tune'>%s</span></div>", tuneStateText((TuneState)tuneState));
     webServer.sendContent(buf);
-    snprintf(buf, sizeof(buf), "<div class='row'><span class='label'>Returned Offset</span><span class='value' id='val-tune-offset'>%d</span></div>", (int)tuneReportedOffset);
+    char offsetText[24];
+    if (tuneOffsetReported) snprintf(offsetText, sizeof(offsetText), "%d", (int)tuneReportedOffset);
+    else snprintf(offsetText, sizeof(offsetText), "Not reported");
+    snprintf(buf, sizeof(buf), "<div class='row'><span class='label'>Returned Offset</span><span class='value' id='val-tune-offset'>%s</span></div>", offsetText);
     webServer.sendContent(buf);
     snprintf(buf, sizeof(buf), "<div class='row'><span class='label'>Control Point</span><span class='value %s' id='val-cp'>%s</span></div>",
              remoteControlPointReady ? "online" : "offline",
@@ -1632,7 +1949,7 @@ static void handleWebRoot() {
     webServer.sendContent(
         "<div class='status-banner' id='action-status'>Ready</div>"
         "<div class='btn-row three'>"
-        "<button class='btn' type='button' onclick=\"sendAction('/tune','Tune request sent. Stay off the bike while calibration runs.')\">Tune Sensor</button>"
+        "<button class='btn' id='tune-button' disabled type='button' onclick=\"sendAction('/tune','Tune request sent. Stay off the bike while calibration runs.')\">Tune Sensor</button>"
         "<button class='btn btn-secondary' type='button' onclick=\"sendAction('/reconnect','Reconnect request sent.')\">Reconnect Sensor</button>"
         "<button class='btn btn-secondary' type='button' onclick=\"sendAction('/find-sensor','Sensor search requested.')\">Find Sensor Again</button>"
         "</div></div>");
@@ -1654,7 +1971,7 @@ static void handleWebRoot() {
         "function upd(id,v){var e=document.getElementById(id);if(e)e.textContent=v;}"
         "function setClass(id,cls){var e=document.getElementById(id);if(e)e.className='value '+cls;}"
         "function setAction(msg){upd('action-status',msg);}"
-        "function sendAction(path,msg){setAction(msg);fetch(path,{method:'POST'}).then(function(r){return r.json();}).then(function(d){if(d&&d.status){setAction(msg);refresh();}}).catch(function(){setAction('Action request failed');});}"
+        "function sendAction(path,msg){setAction('Sending request...');fetch(path,{method:'POST'}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.message||d.status||'request failed');return d;});}).then(function(){setAction(msg);refresh();}).catch(function(e){setAction('Action request failed: '+e.message);});}"
         "function refresh(){fetch('/api/live?ts='+(new Date().getTime())).then(function(r){return r.json();}).then(function(d){"
         "upd('val-power',d.broadcastPower+' W');"
         "upd('val-cadence',Number(d.cadence).toFixed(1)+' RPM');"
@@ -1665,20 +1982,19 @@ static void handleWebRoot() {
         "upd('val-ble-sensor',d.sensorConnected?'Connected':'Searching');"
         "setClass('val-ble-sensor',d.sensorConnected?'online':'offline');"
         "upd('val-ble-apps',d.appConnections);"
-        "upd('val-wifi',d.wifiConnected?d.wifiIp:(d.wifiProvisioned?'Waiting':'Not provisioned'));"
+        "upd('val-wifi',d.wifiConnected?'Connected':(d.wifiProvisioned?'Waiting':'Not provisioned'));upd('val-wifi-ip',d.wifiConnected?d.wifiIp:'?');"
         "setClass('val-wifi',d.wifiConnected?'online':'offline');"
         "upd('val-mqtt',d.mqttConnected?'Connected':(d.mqttEnabled?'Configured':'Disabled'));"
         "setClass('val-mqtt',d.mqttConnected?'online':'offline');"
         "upd('val-broker',(d.mqttEnabled&&d.mqttHost)?(d.mqttHost+':'+d.mqttPort):'');"
-        "upd('val-tune',d.tuneStatus);"
-        "upd('val-tune-offset',d.tuneReportedOffset);"
+        "upd('val-tune',d.tuneStatus);document.getElementById('tune-button').disabled=!d.tuneCanStart;"
+        "upd('val-tune-offset',d.tuneOffsetReported?d.tuneReportedOffset:'Not reported');"
         "upd('val-cp',d.remoteControlPointReady?'Ready':'Unavailable');"
         "setClass('val-cp',d.remoteControlPointReady?'online':'offline');"
         "upd('val-mode',d.servingMode);"
         "upd('val-cached',d.cachedValid?d.cachedAddress:'No');"
         "upd('val-uptime',fmtUptime(d.uptimeSec));"
         "upd('val-heap',Math.round(d.freeHeap/1024)+' KB');"
-        "if(d.lastMessage){setAction(d.lastMessage);}"
         "}).catch(function(){});}"
         "refresh();setInterval(refresh,500);"
         "</script></body></html>");
@@ -1711,22 +2027,13 @@ static void handleDiagnosticsRoot() {
         "</span></div></section>"
         "<section class='card'><h2>Status / Logs</h2>"
         "<div class='row'><span class='label'>Last Event</span><span class='value' id='msg'>");
-    webServer.sendContent(lastUiMessage);
-    webServer.sendContent(
-        "</span></div><div class='row'><span class='label'>MQTT Test</span><span class='value' id='mqttTest'>");
-    webServer.sendContent(lastMqttTestResult);
+    if (lastUiMessage[0]) webServer.sendContent(lastUiMessage);
     webServer.sendContent(
         "</span></div><div class='row'><span class='label'>Firmware</span><span class='value'>");
     webServer.sendContent(FW_VERSION);
-    webServer.sendContent("</span></div><pre id='eventLog'>");
-    for (uint8_t i = 0; i < eventLogCount; i++) {
-        int idx = (int)eventLogNext - (int)eventLogCount + i;
-        while (idx < 0) idx += 10;
-        webServer.sendContent(eventLog[idx]);
-        if (i + 1 < eventLogCount) webServer.sendContent("\n");
-    }
+    webServer.sendContent("</span></div><a href='/api/logs' download='myx-bridge-logs.txt'>Download Logs</a><pre id='eventLog'></pre><h3>Packet Statistics</h3><pre id='packetStats'></pre>");
     webServer.sendContent(
-        "</pre></section>"
+        "</section>"
         "<section class='card'><h2>Local Fallback Correction</h2><form method='post' action='/settings/cal'>"
         "<label class='inline-check'><input type='checkbox' name='enabled'");
     if (calibration.correctionEnabled) webServer.sendContent(" checked");
@@ -1763,8 +2070,9 @@ static void handleDiagnosticsRoot() {
         "</section></div>"
         "<script>"
         "function setVal(id,v){var e=document.getElementById(id);if(e)e.textContent=v;}"
-        "function refresh(){var x=new XMLHttpRequest();x.open('GET','/api/live?ts='+(new Date().getTime()),true);x.onreadystatechange=function(){if(x.readyState!==4||x.status!==200)return;try{var d=JSON.parse(x.responseText);setVal('raw',d.rawPower+' W');setVal('zeroed',d.zeroedPower+' W');setVal('corrected',d.correctedPower+' W');setVal('appliedOffset',Number(d.appliedCadenceOffset).toFixed(1)+' W');setVal('battery',d.battery);setVal('energy',d.energy+' kJ');setVal('msg',d.lastMessage);setVal('mqttTest','See Network Settings');var held=d.cadenceHeld?'yes':'no';var drop=d.dropped?'yes':'no';document.getElementById('eventLog').textContent='Packet interval: '+d.packetIntervalMs+' ms\\nCrank rev delta: '+d.crankRevDelta+'\\nCrank time delta: '+d.crankTimeDelta+'\\nCadence held: '+held+'\\nDropped: '+drop;}catch(e){}};x.send();}"
-        "refresh();setInterval(refresh,500);"
+        "function refresh(){var x=new XMLHttpRequest();x.open('GET','/api/live?ts='+(new Date().getTime()),true);x.onreadystatechange=function(){if(x.readyState!==4||x.status!==200)return;try{var d=JSON.parse(x.responseText);setVal('raw',d.rawPower+' W');setVal('zeroed',d.zeroedPower+' W');setVal('corrected',d.correctedPower+' W');setVal('appliedOffset',Number(d.appliedCadenceOffset).toFixed(1)+' W');setVal('battery',d.battery);setVal('energy',d.energy+' kJ');setVal('msg',d.lastMessage);var held=d.cadenceHeld?'yes':'no';var drop=d.dropped?'yes':'no';document.getElementById('packetStats').textContent='Packet interval: '+d.packetIntervalMs+' ms\\nCrank rev delta: '+d.crankRevDelta+'\\nCrank time delta: '+d.crankTimeDelta+'\\nCadence held: '+held+'\\nDropped: '+drop;}catch(e){}};x.send();}"
+        "function refreshLogs(){fetch('/api/status').then(function(r){return r.json();}).then(function(d){setVal('eventLog',d.eventLog.join('\\n'));}).catch(function(){});}"
+        "refresh();refreshLogs();setInterval(refresh,500);setInterval(refreshLogs,3000);"
         "</script>");
     sendPageEnd();
 }
@@ -1788,8 +2096,6 @@ static void handleNetworkRoot() {
         ".note{color:#9aa3b4;line-height:1.45;margin:0 0 12px}"
         "</style></head><body><h1>MYX Bridge</h1><div class='subtitle'>Network Settings</div>"
         "<div class='nav'><a href='/'>Overview</a><a href='/diag'>Diagnostics</a><a class='active' href='/network'>Network Settings</a><a href='/update'>OTA</a></div>"
-        "<section class='card'><h2>Guided Setup Portal</h2><p class='note'>Use the standard WiFiManager portal for WiFi and MQTT entry. The bridge will restart after saving.</p>"
-        "<form method='post' action='/start-config-portal'><button type='submit'>Launch WiFi/MQTT Setup Portal</button></form></section>"
         "<section class='card'><h2>WiFi Settings</h2><p class='note'>Saving WiFi changes only WiFi credentials. MQTT settings stay separate.</p>"
         "<form method='post' action='/settings/wifi'>"
         "<label class='check'><input type='checkbox' name='provisioned'");
@@ -1797,25 +2103,24 @@ static void handleNetworkRoot() {
     webServer.sendContent(
         ">WiFi enabled / provisioned</label>"
         "<label>SSID<input name='ssid' maxlength='32' value='");
-    webServer.sendContent(wifiConfig.ssid);
+    if (wifiConfig.ssid[0]) webServer.sendContent(escapeHtml(wifiConfig.ssid));
     webServer.sendContent(
         "'></label>"
         "<label>Password<input name='password' type='password' maxlength='64' value='");
-    webServer.sendContent(wifiConfig.password);
     webServer.sendContent(
-        "'></label>"
+        "' placeholder='Leave blank to keep saved password'></label><label><input type='checkbox' name='clear_password'>Clear WiFi password</label>"
         "<div class='actions'><button type='submit'>Save WiFi</button></div>"
         "</form>"
         "<form method='post' action='/reset-wifi'><div class='actions'><button type='submit' class='warn'>Reset WiFi</button></div></form>"
         "</section>"
-        "<section class='card'><h2>MQTT Settings</h2><p class='note'>Saving MQTT does not touch WiFi. Use Test MQTT for a broker check while connected on LAN.</p>"
+        "<section class='card' id='mqtt'><h2>MQTT Settings</h2><p class='note'>Saving MQTT does not touch WiFi. Use Test MQTT for a broker check while connected on LAN.</p>"
         "<form id='mqtt-form' method='post' action='/settings/mqtt'>"
         "<label class='check'><input type='checkbox' name='enabled'");
     if (mqttConfig.enabled) webServer.sendContent(" checked");
     webServer.sendContent(
         ">MQTT enabled</label>"
         "<label>Host<input name='host' maxlength='63' value='");
-    webServer.sendContent(mqttConfig.host);
+    if (mqttConfig.host[0]) webServer.sendContent(escapeHtml(mqttConfig.host));
     webServer.sendContent(
         "'></label>"
         "<label>Port<input name='port' type='number' min='1' max='65535' value='");
@@ -1823,15 +2128,14 @@ static void handleNetworkRoot() {
     webServer.sendContent(
         "'></label>"
         "<label>Username<input name='user' maxlength='31' value='");
-    webServer.sendContent(mqttConfig.user);
+    if (mqttConfig.user[0]) webServer.sendContent(escapeHtml(mqttConfig.user));
     webServer.sendContent(
         "'></label>"
         "<label>Password<input name='pass' type='password' maxlength='63' value='");
-    webServer.sendContent(mqttConfig.pass);
     webServer.sendContent(
-        "'></label>"
+        "' placeholder='Leave blank to keep saved password'></label><label><input type='checkbox' name='clear_pass'>Clear MQTT password</label>"
         "<div class='row'><span class='label'>MQTT Test</span><span class='value' id='mqttTest'>");
-    webServer.sendContent(lastMqttTestResult);
+    if (lastMqttTestResult[0]) webServer.sendContent(lastMqttTestResult);
     webServer.sendContent(
         "</span></div>"
         "<div class='actions'><button type='submit'>Save MQTT</button><button type='button' class='secondary' onclick='testMqtt()'>Test MQTT</button></div>"
@@ -1841,7 +2145,7 @@ static void handleNetworkRoot() {
         "<section class='card'><h2>Reset</h2><form method='post' action='/full-reset'><button type='submit' class='warn' onclick=\"return confirm('Full reset WiFi, MQTT, cached sensor, and correction settings?')\">Full Reset</button></form></section>"
         "<script>"
         "function encodeForm(form){var els=form.elements,parts=[],i,e;for(i=0;i<els.length;i++){e=els[i];if(!e.name)continue;if((e.type==='checkbox'||e.type==='radio')&&!e.checked)continue;parts.push(encodeURIComponent(e.name)+'='+encodeURIComponent(e.value));}return parts.join('&');}"
-        "function testMqtt(){var form=document.getElementById('mqtt-form');var xhr=new XMLHttpRequest();xhr.open('POST','/test-mqtt',true);xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');xhr.onreadystatechange=function(){if(xhr.readyState!==4||xhr.status!==200)return;try{var d=JSON.parse(xhr.responseText);document.getElementById('mqttTest').textContent=d.result;}catch(e){document.getElementById('mqttTest').textContent='Test failed';}};xhr.send(encodeForm(form));}"
+        "function testMqtt(){var form=document.getElementById('mqtt-form');var xhr=new XMLHttpRequest();xhr.open('POST','/test-mqtt',true);xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');xhr.onreadystatechange=function(){if(xhr.readyState!==4)return;if(xhr.status!==200){document.getElementById('mqttTest').textContent='Test request failed';return;}try{var d=JSON.parse(xhr.responseText);document.getElementById('mqttTest').textContent=d.result;}catch(e){document.getElementById('mqttTest').textContent='Test failed';}};xhr.send(encodeForm(form));}"
         "</script></body></html>");
     webServer.sendContent("");
 }
@@ -1865,60 +2169,51 @@ static void sendSettingsJsonOnly() {
 }
 
 static void handleWebLiveJson() {
-    char payload[1024];
-    char battery[8];
-    if (lastBattery == 0xFF) snprintf(battery, sizeof(battery), "?");
-    else snprintf(battery, sizeof(battery), "%d%%", (int)lastBattery);
-
-    snprintf(payload, sizeof(payload),
-             "{\"broadcastPower\":%d,\"cadence\":%.1f,\"battery\":\"%s\","
-             "\"rawPower\":%d,\"zeroedPower\":%d,\"correctedPower\":%d,"
-             "\"appliedCadenceOffset\":%.1f,\"energy\":%u,\"crankRev\":%u,"
-             "\"crankTime\":%u,\"packetIntervalMs\":%lu,\"crankRevDelta\":%u,"
-             "\"crankTimeDelta\":%u,\"cadenceHeld\":%s,\"dropped\":%s,"
-             "\"sensorConnected\":%s,"
-             "\"appConnections\":%d,\"recoveryState\":\"%s\",\"remoteControlPointReady\":%s,"
-             "\"tuneStatus\":\"%s\",\"tuneReportedOffset\":%d,\"servingMode\":\"%s\","
-             "\"wifiConnected\":%s,\"wifiProvisioned\":%s,\"wifiIp\":\"%s\","
-             "\"mqttConnected\":%s,\"mqttEnabled\":%s,\"mqttHost\":\"%s\",\"mqttPort\":%u,"
-             "\"cachedValid\":%s,\"cachedAddress\":\"%s\",\"uptimeSec\":%lu,"
-             "\"freeHeap\":%u,\"lastMessage\":\"%s\"}",
-             (int)lastBroadcastPower,
-             (double)lastCadence,
-             battery,
-             (int)lastRawPower,
-             (int)lastZeroedPower,
-             (int)lastCorrectedPower,
-             (double)lastAppliedCadenceOffset,
-             (unsigned int)lastEnergy,
-             (unsigned int)lastCrankRev,
-             (unsigned int)lastCrankTime,
-             (unsigned long)lastPacketIntervalMs,
-             (unsigned int)lastCrankRevDelta,
-             (unsigned int)lastCrankTimeDelta,
-             lastCadenceHeld ? "true" : "false",
-             lastDropped ? "true" : "false",
-             sensorConnected ? "true" : "false",
-             appConnectionCount,
-             recoveryStateText(recoveryState),
-             remoteControlPointReady ? "true" : "false",
-             tuneStateText((TuneState)tuneState),
-             (int)tuneReportedOffset,
-             servingModeText(),
-             WiFi.status() == WL_CONNECTED ? "true" : "false",
-             wifiConfig.provisioned ? "true" : "false",
-             WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "",
-             mqttConnected ? "true" : "false",
-             mqttConfig.enabled ? "true" : "false",
-             mqttConfig.host,
-             (unsigned int)mqttConfig.port,
-             cachedSensor.valid ? "true" : "false",
-             cachedSensor.address,
-             (unsigned long)(millis() / 1000),
-             (unsigned int)ESP.getFreeHeap(),
-             lastUiMessage);
+    // Reuse the status endpoint's JSON serializer, including correct escaping.
+    JsonDocument doc;
+    doc["broadcastPower"] = (int)lastBroadcastPower;
+    doc["cadence"] = (float)lastCadence;
+    doc["battery"] = batteryText();
+    doc["rawPower"] = (int)lastRawPower;
+    doc["zeroedPower"] = (int)lastZeroedPower;
+    doc["correctedPower"] = (int)lastCorrectedPower;
+    doc["appliedCadenceOffset"] = (float)lastAppliedCadenceOffset;
+    doc["energy"] = (unsigned)lastEnergy;
+    doc["crankRev"] = (unsigned)lastCrankRev;
+    doc["crankTime"] = (unsigned)lastCrankTime;
+    doc["packetIntervalMs"] = (unsigned long)lastPacketIntervalMs;
+    doc["crankRevDelta"] = (unsigned)lastCrankRevDelta;
+    doc["crankTimeDelta"] = (unsigned)lastCrankTimeDelta;
+    doc["cadenceHeld"] = (bool)lastCadenceHeld;
+    doc["dropped"] = (bool)lastDropped;
+    doc["sensorConnected"] = (bool)sensorConnected;
+    doc["appConnections"] = appConnectionCount;
+    doc["recoveryState"] = recoveryStateText(recoveryState);
+    doc["remoteControlPointReady"] = (bool)remoteControlPointReady;
+    doc["tuneStatus"] = tuneStateText((TuneState)tuneState);
+    doc["tuneCanStart"] = sensorConnected && remoteControlPointReady && remotePowerControlPoint != nullptr && tuneState != TUNE_ENHANCED_SENT && tuneState != TUNE_STANDARD_SENT && !tuneRequested && !tuneTimedOut;
+    doc["tuneOffsetReported"] = (bool)tuneOffsetReported;
+    if (tuneOffsetReported) doc["tuneReportedOffset"] = (int)tuneReportedOffset;
+    else doc["tuneReportedOffset"] = nullptr;
+    doc["servingMode"] = servingModeText();
+    doc["wifiConnected"] = WiFi.status() == WL_CONNECTED;
+    doc["wifiProvisioned"] = wifiConfig.provisioned;
+    doc["wifiIp"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("");
+    doc["mqttConnected"] = mqttConnected;
+    doc["mqttEnabled"] = mqttConfig.enabled;
+    doc["mqttHost"] = mqttConfig.host;
+    doc["mqttPort"] = mqttConfig.port;
+    doc["mqttTestResult"] = lastMqttTestResult;
+    doc["cachedValid"] = cachedSensor.valid;
+    doc["cachedAddress"] = cachedSensor.address;
+    doc["uptimeSec"] = millis() / 1000;
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["lastMessage"] = lastUiMessage;
+    String json;
+    serializeJson(doc, json);
     sendNoCacheHeaders();
-    webServer.send(200, "application/json", payload);
+    webServer.send(200, "application/json", json);
+    return;
 }
 
 static void handleWebStatusJson() {
@@ -1946,8 +2241,46 @@ static void handleWebStatusJson() {
     doc["tuneStatus"] = tuneStateText((TuneState)tuneState);
     doc["tuneLastOp"] = (int)tuneLastOp;
     doc["tuneLastResponse"] = (int)tuneLastResponse;
-    doc["tuneReportedOffset"] = (int)tuneReportedOffset;
+    doc["tuneOffsetReported"] = (bool)tuneOffsetReported;
+    if (tuneOffsetReported) doc["tuneReportedOffset"] = (int)tuneReportedOffset;
+    else doc["tuneReportedOffset"] = nullptr;
     doc["tuneFailureReason"] = (int)tuneFailureReason;
+    TuneDiagnostics diag;
+    portENTER_CRITICAL(&tuneMux);
+    diag = tuneDiag;
+    portEXIT_CRITICAL(&tuneMux);
+    JsonObject td = doc["tuneDiagnostics"].to<JsonObject>();
+    td["clientIf"] = diag.clientIf;
+    td["connId"] = diag.connId;
+    td["controlPointHandle"] = diag.cpHandle;
+    td["cccdHandle"] = diag.cccdHandle;
+    td["canWrite"] = diag.canWrite;
+    td["canIndicate"] = diag.canIndicate;
+    td["canNotify"] = diag.canNotify;
+    td["featureValid"] = diag.featureValid;
+    td["featureBits"] = diag.featureBits;
+    td["writeSeen"] = diag.writeSeen;
+    td["writeStatus"] = diag.writeStatus;
+    td["writeStartedMs"] = diag.writeStartedMs;
+    td["writeEventMs"] = diag.writeEventMs;
+    td["writeCount"] = diag.writeCount;
+    td["cccdSeen"] = diag.cccdSeen;
+    td["cccdStatus"] = diag.cccdStatus;
+    td["cccdEventMs"] = diag.cccdEventMs;
+    td["cccdCount"] = diag.cccdCount;
+    td["registrationSeen"] = diag.registrationSeen;
+    td["registrationStatus"] = diag.registrationStatus;
+    td["registrationEventMs"] = diag.registrationEventMs;
+    td["registrationCount"] = diag.registrationCount;
+    td["responseCount"] = diag.responseCount;
+    td["responseMs"] = diag.responseMs;
+    td["responseLength"] = diag.responseLength;
+    td["responseNotify"] = diag.responseNotify;
+    td["responseAccepted"] = diag.responseAccepted;
+    td["responseState"] = diag.responseState;
+    td["responseExpectedOp"] = diag.responseExpectedOp;
+    JsonArray raw = td["responseBytes"].to<JsonArray>();
+    for (size_t i = 0; i < diag.responseCaptured; ++i) raw.add(diag.responseBytes[i]);
     doc["recoveryState"] = recoveryStateText(recoveryState);
     doc["servingMode"] = servingModeText();
     doc["lastMessage"] = lastUiMessage;
@@ -1968,7 +2301,6 @@ static void handleWebStatusJson() {
     wifi["provisioned"] = wifiConfig.provisioned;
     wifi["connected"] = WiFi.status() == WL_CONNECTED;
     wifi["ssid"] = wifiConfig.ssid;
-    wifi["password"] = wifiConfig.password;
     wifi["ip"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "";
 
     JsonObject mqtt = doc["mqtt"].to<JsonObject>();
@@ -1978,7 +2310,6 @@ static void handleWebStatusJson() {
     mqtt["host"] = mqttConfig.host;
     mqtt["port"] = mqttConfig.port;
     mqtt["user"] = mqttConfig.user;
-    mqtt["pass"] = mqttConfig.pass;
     mqtt["testResult"] = lastMqttTestResult;
 
     JsonObject cached = doc["cachedSensor"].to<JsonObject>();
@@ -1987,11 +2318,12 @@ static void handleWebStatusJson() {
     cached["name"] = cachedSensor.lastName;
 
     JsonArray eventLogJson = doc["eventLog"].to<JsonArray>();
-    for (uint8_t i = 0; i < eventLogCount; i++) {
-        int idx = (int)eventLogNext - (int)eventLogCount + i;
-        while (idx < 0) idx += 10;
-        eventLogJson.add(eventLog[idx]);
+    EventLogSnapshot* logs = snapshotEventLog();
+    if (logs) {
+        for (uint8_t i = 0; i < logs->count; ++i) eventLogJson.add(logs->lines[i]);
+        free(logs);
     }
+
 
     String payload;
     serializeJson(doc, payload);
@@ -1999,9 +2331,59 @@ static void handleWebStatusJson() {
     webServer.send(200, "application/json", payload);
 }
 
+static void handleLogsDownload() {
+    EventLogSnapshot* logs = snapshotEventLog();
+    if (!logs) { webServer.send(503, "text/plain", "Log snapshot unavailable"); return; }
+    TuneDiagnostics diag;
+    portENTER_CRITICAL(&tuneMux);
+    diag = tuneDiag;
+    portEXIT_CRITICAL(&tuneMux);
+    sendNoCacheHeaders();
+    webServer.sendHeader("Content-Disposition", "attachment; filename=\"myx-bridge-logs.txt\"");
+    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webServer.send(200, "text/plain; charset=utf-8", "");
+    char line[256];
+    snprintf(line, sizeof(line), "MYX Bridge firmware %s\nUptime: %lu ms\nEvents (oldest first):\n", FW_VERSION, (unsigned long)millis());
+    webServer.sendContent(line);
+    for (uint8_t i = 0; i < logs->count; ++i) { webServer.sendContent(logs->lines[i]); webServer.sendContent("\n"); }
+    free(logs);
+    snprintf(line, sizeof(line), "\nTune diagnostics: write status=%d count=%lu; CCCD status=%d count=%lu; registration status=%d count=%lu\nResponse: length=%u captured=%u accepted=%u notify=%u expected opcode=0x%02X state=%u bytes=", diag.writeStatus, (unsigned long)diag.writeCount, diag.cccdStatus, (unsigned long)diag.cccdCount, diag.registrationStatus, (unsigned long)diag.registrationCount, (unsigned)diag.responseLength, (unsigned)diag.responseCaptured, (unsigned)diag.responseAccepted, (unsigned)diag.responseNotify, diag.responseExpectedOp, diag.responseState);
+    webServer.sendContent(line);
+    for (size_t i = 0; i < diag.responseCaptured && i < sizeof(diag.responseBytes); ++i) { snprintf(line, sizeof(line), "%s%02X", i ? " " : "", diag.responseBytes[i]); webServer.sendContent(line); }
+    webServer.sendContent("\n");
+    webServer.sendContent("");
+}
+
 static void handleTunePost() {
-    tuneRequested = true;
-    tuneState = TUNE_IDLE;
+    enum TuneRequestResult { QUEUED, DISCONNECTED, NO_CONTROL_POINT, TIMED_OUT, BUSY };
+    TuneRequestResult result;
+    portENTER_CRITICAL(&tuneMux);
+    if (!sensorConnected) result = DISCONNECTED;
+    else if (!remoteControlPointReady || remotePowerControlPoint == nullptr) result = NO_CONTROL_POINT;
+    else if (tuneTimedOut) result = TIMED_OUT;
+    else if (tuneState == TUNE_ENHANCED_SENT || tuneState == TUNE_STANDARD_SENT || tuneRequested) result = BUSY;
+    else {
+        tuneRequested = true;
+        tuneState = TUNE_IDLE;
+        result = QUEUED;
+    }
+    portEXIT_CRITICAL(&tuneMux);
+    if (result == DISCONNECTED) {
+        webServer.send(409, "application/json", "{\"status\":\"unavailable\",\"message\":\"Sensor is not connected. Pedal to wake it and wait for it to connect.\"}");
+        return;
+    }
+    if (result == NO_CONTROL_POINT) {
+        webServer.send(409, "application/json", "{\"status\":\"unavailable\",\"message\":\"Sensor control point is unavailable.\"}");
+        return;
+    }
+    if (result == TIMED_OUT) {
+        webServer.send(409, "application/json", "{\"status\":\"unavailable\",\"message\":\"The previous tune timed out. Reconnect the sensor before retrying.\"}");
+        return;
+    }
+    if (result == BUSY) {
+        webServer.send(409, "application/json", "{\"status\":\"busy\",\"message\":\"A sensor tune is already in progress.\"}");
+        return;
+    }
     setUiMessage("Tune requested");
     webServer.send(202, "application/json", "{\"status\":\"queued\",\"message\":\"Tune requested\"}");
 }
@@ -2019,20 +2401,12 @@ static void handleFindAgainPost() {
 }
 
 static void handleStartConfigPortalPost() {
-    configPortalRequested = true;
-    configPortalStartAtMs = millis() + 750;
-    webServer.send(200, "text/html",
-                   "<!doctype html><html><head><meta charset='utf-8'>"
-                   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                   "<meta http-equiv='refresh' content='8;url=/'>"
-                   "<title>Starting Setup</title></head>"
-                   "<body style='font-family:sans-serif;background:#1a1a2e;color:#e0e0e0;padding:30px'>"
-                   "<h2>Starting WiFi/MQTT setup portal...</h2>"
-                   "<p>If the page changes networks, reconnect to <b>MYX-Bridge-Setup</b> and open <b>192.168.4.1</b>.</p>"
-                   "</body></html>");
+    webServer.sendHeader("Location", "/network", true);
+    webServer.send(303, "text/plain", "Use network settings");
 }
 
 static void handleCalibrationPost() {
+    CalibrationSettings previous = calibration;
     calibration.correctionEnabled = webServer.hasArg("enabled");
     calibration.rawDiagnosticsEnabled = webServer.hasArg("rawdiag");
     calibration.localZeroOffset = argFloat("zero", calibration.localZeroOffset);
@@ -2045,6 +2419,17 @@ static void handleCalibrationPost() {
         calibration.cadence[i] = argFloat(key, calibration.cadence[i]);
         snprintf(key, sizeof(key), "off%d", i);
         calibration.cadenceOffset[i] = argFloat(key, calibration.cadenceOffset[i]);
+    }
+    bool valid = isfinite(calibration.localZeroOffset) && fabs(calibration.localZeroOffset) <= 32767.0f;
+    for (int i = 0; i < 4; i++) {
+        valid = valid && isfinite(calibration.cadence[i]) && calibration.cadence[i] >= 0 && calibration.cadence[i] <= 250;
+        valid = valid && isfinite(calibration.cadenceOffset[i]) && fabs(calibration.cadenceOffset[i]) <= 32767.0f;
+        if (i > 0) valid = valid && calibration.cadence[i] > calibration.cadence[i - 1];
+    }
+    if (!valid) {
+        calibration = previous;
+        webServer.send(400, "text/plain", "Invalid calibration values: use finite offsets and increasing cadence points from 0 to 250 RPM.");
+        return;
     }
     saveCalibration();
     setUiMessage("Correction settings saved");
@@ -2065,7 +2450,8 @@ static void handleWiFiSettingsPost() {
 
     wifiConfig.provisioned = webServer.hasArg("provisioned") && webServer.arg("ssid").length() > 0;
     strlcpy(wifiConfig.ssid, webServer.arg("ssid").c_str(), sizeof(wifiConfig.ssid));
-    strlcpy(wifiConfig.password, webServer.arg("password").c_str(), sizeof(wifiConfig.password));
+    if (webServer.hasArg("clear_password")) wifiConfig.password[0] = '\0';
+    else if (webServer.arg("password").length()) strlcpy(wifiConfig.password, webServer.arg("password").c_str(), sizeof(wifiConfig.password));
     saveWiFiConfig();
 
     if (!wifiConfig.provisioned) {
@@ -2082,8 +2468,9 @@ static void handleWiFiSettingsPost() {
 }
 
 static void handleResetWiFiPost() {
+    mqttDisconnectCleanly();
+    mqttConnected = false;
     clearWiFiConfig();
-    WiFi.disconnect(true);
     setUiMessage("WiFi settings reset");
     webServer.send(200, "application/json", "{\"status\":\"wifi-reset\"}");
     scheduleRestart("WiFi reset, restarting");
@@ -2094,12 +2481,13 @@ static void handleMqttSettingsPost() {
     strlcpy(mqttConfig.host, webServer.arg("host").c_str(), sizeof(mqttConfig.host));
     mqttConfig.port = argU16("port", MQTT_DEFAULT_PORT);
     strlcpy(mqttConfig.user, webServer.arg("user").c_str(), sizeof(mqttConfig.user));
-    strlcpy(mqttConfig.pass, webServer.arg("pass").c_str(), sizeof(mqttConfig.pass));
+    if (webServer.hasArg("clear_pass")) mqttConfig.pass[0] = '\0';
+    else if (webServer.arg("pass").length()) strlcpy(mqttConfig.pass, webServer.arg("pass").c_str(), sizeof(mqttConfig.pass));
     if (strlen(mqttConfig.host) == 0) {
         mqttConfig.enabled = false;
     }
     saveMqttConfig();
-    mqttClient.disconnect();
+    mqttDisconnectCleanly();
     mqttConnected = false;
     setUiMessage("MQTT settings saved");
     webServer.sendHeader("Location", "/network", true);
@@ -2108,7 +2496,7 @@ static void handleMqttSettingsPost() {
 
 static void handleResetMqttPost() {
     clearMqttConfig();
-    mqttClient.disconnect();
+    mqttDisconnectCleanly();
     mqttConnected = false;
     strlcpy(lastMqttTestResult, "Not tested", sizeof(lastMqttTestResult));
     setUiMessage("MQTT settings reset");
@@ -2117,11 +2505,12 @@ static void handleResetMqttPost() {
 
 static void handleTestMqttPost() {
     MqttConfig temp = mqttConfig;
-    temp.enabled = webServer.hasArg("enabled");
+    if (webServer.hasArg("host")) temp.enabled = webServer.hasArg("enabled");
     if (webServer.hasArg("host")) strlcpy(temp.host, webServer.arg("host").c_str(), sizeof(temp.host));
     if (webServer.hasArg("port")) temp.port = argU16("port", temp.port);
     if (webServer.hasArg("user")) strlcpy(temp.user, webServer.arg("user").c_str(), sizeof(temp.user));
-    if (webServer.hasArg("pass")) strlcpy(temp.pass, webServer.arg("pass").c_str(), sizeof(temp.pass));
+    if (webServer.hasArg("clear_pass")) temp.pass[0] = '\0';
+    else if (webServer.arg("pass").length()) strlcpy(temp.pass, webServer.arg("pass").c_str(), sizeof(temp.pass));
 
     bool ok = false;
     if (!temp.enabled || strlen(temp.host) == 0) {
@@ -2139,10 +2528,9 @@ static void handleTestMqttPost() {
 }
 
 static void handleFullResetPost() {
-    fullReset();
-    WiFi.disconnect(true);
-    mqttClient.disconnect();
+    mqttDisconnectCleanly();
     mqttConnected = false;
+    fullReset();
     setUiMessage("Full reset complete");
     webServer.send(200, "application/json", "{\"status\":\"full-reset\"}");
     scheduleRestart("Full reset, restarting");
@@ -2185,17 +2573,19 @@ static void handleOtaPage() {
 }
 
 static void handleOtaResult() {
-    if (Update.hasError()) {
+    if (!otaComplete || Update.hasError()) {
         webServer.send(500, "text/plain", "OTA failed");
     } else {
         webServer.send(200, "text/plain", "OK");
         scheduleRestart("OTA complete, restarting");
     }
+    otaComplete = false;
 }
 
 static void handleOtaUpload() {
     HTTPUpload& upload = webServer.upload();
     if (upload.status == UPLOAD_FILE_START) {
+        otaComplete = false;
         Serial.printf("[OTA] Begin: %s\n", upload.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
             Update.printError(Serial);
@@ -2206,10 +2596,14 @@ static void handleOtaUpload() {
         }
     } else if (upload.status == UPLOAD_FILE_END) {
         if (Update.end(true)) {
+            otaComplete = true;
             Serial.printf("[OTA] Success: %u bytes\n", (unsigned)upload.totalSize);
         } else {
             Update.printError(Serial);
         }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        Update.abort();
+        otaComplete = false;
     }
 }
 
@@ -2219,26 +2613,31 @@ static void handleNotFound() {
 
 static void registerWebRoutes() {
     if (routesRegistered) return;
-    webServer.on("/", HTTP_GET, handleWebRoot);
-    webServer.on("/diag", HTTP_GET, handleDiagnosticsRoot);
-    webServer.on("/network", HTTP_GET, handleNetworkRoot);
-    webServer.on("/api/live", HTTP_GET, handleWebLiveJson);
-    webServer.on("/api/status", HTTP_GET, handleWebStatusJson);
-    webServer.on("/api/settings", HTTP_GET, sendSettingsJsonOnly);
-    webServer.on("/settings/cal", HTTP_POST, handleCalibrationPost);
-    webServer.on("/settings/wifi", HTTP_POST, handleWiFiSettingsPost);
-    webServer.on("/settings/mqtt", HTTP_POST, handleMqttSettingsPost);
-    webServer.on("/tune", HTTP_POST, handleTunePost);
-    webServer.on("/reconnect", HTTP_POST, handleReconnectPost);
-    webServer.on("/find-sensor", HTTP_POST, handleFindAgainPost);
-    webServer.on("/start-config-portal", HTTP_POST, handleStartConfigPortalPost);
-    webServer.on("/reset-cal", HTTP_POST, handleResetCalibrationPost);
-    webServer.on("/reset-wifi", HTTP_POST, handleResetWiFiPost);
-    webServer.on("/reset-mqtt", HTTP_POST, handleResetMqttPost);
-    webServer.on("/test-mqtt", HTTP_POST, handleTestMqttPost);
-    webServer.on("/full-reset", HTTP_POST, handleFullResetPost);
-    webServer.on("/update", HTTP_GET, handleOtaPage);
-    webServer.on("/update", HTTP_POST, handleOtaResult, handleOtaUpload);
+    const char* headers[] = {"Origin", "Host"};
+    webServer.collectHeaders(headers, 2);
+    webServer.on("/", HTTP_GET, [](){ if (setupWindow) handleSetupPage(); else if (authorizeWeb()) handleWebRoot(); });
+    webServer.on("/setup", HTTP_GET, handleSetupPage);
+    webServer.on("/setup", HTTP_POST, handleSetupPost);
+    webServer.on("/diag", HTTP_GET, [](){ if (authorizeWeb()) handleDiagnosticsRoot(); });
+    webServer.on("/network", HTTP_GET, [](){ if (authorizeWeb()) handleNetworkRoot(); });
+    webServer.on("/api/live", HTTP_GET, [](){ if (authorizeWeb()) handleWebLiveJson(); });
+    webServer.on("/api/status", HTTP_GET, [](){ if (authorizeWeb()) handleWebStatusJson(); });
+    webServer.on("/api/logs", HTTP_GET, [](){ if (authorizeWeb()) handleLogsDownload(); });
+    webServer.on("/api/settings", HTTP_GET, [](){ if (authorizeWeb()) sendSettingsJsonOnly(); });
+    webServer.on("/settings/cal", HTTP_POST, [](){ if (authorizeWeb()) handleCalibrationPost(); });
+    webServer.on("/settings/wifi", HTTP_POST, [](){ if (authorizeWeb()) handleWiFiSettingsPost(); });
+    webServer.on("/settings/mqtt", HTTP_POST, [](){ if (authorizeWeb()) handleMqttSettingsPost(); });
+    webServer.on("/tune", HTTP_POST, [](){ if (authorizeWeb()) handleTunePost(); });
+    webServer.on("/reconnect", HTTP_POST, [](){ if (authorizeWeb()) handleReconnectPost(); });
+    webServer.on("/find-sensor", HTTP_POST, [](){ if (authorizeWeb()) handleFindAgainPost(); });
+    webServer.on("/start-config-portal", HTTP_POST, [](){ if (authorizeWeb()) handleStartConfigPortalPost(); });
+    webServer.on("/reset-cal", HTTP_POST, [](){ if (authorizeWeb()) handleResetCalibrationPost(); });
+    webServer.on("/reset-wifi", HTTP_POST, [](){ if (authorizeWeb()) handleResetWiFiPost(); });
+    webServer.on("/reset-mqtt", HTTP_POST, [](){ if (authorizeWeb()) handleResetMqttPost(); });
+    webServer.on("/test-mqtt", HTTP_POST, [](){ if (authorizeWeb()) handleTestMqttPost(); });
+    webServer.on("/full-reset", HTTP_POST, [](){ if (authorizeWeb()) handleFullResetPost(); });
+    webServer.on("/update", HTTP_GET, [](){ if (authorizeWeb()) handleOtaPage(); });
+    webServer.on("/update", HTTP_POST, [](){ if (authorizeWeb()) handleOtaResult(); }, [](){ if (!setupWindow && adminConfigured && webServer.authenticate("admin", adminPassword) && (!webServer.hasHeader("Origin") || webServer.header("Origin") == "http://" + webServer.header("Host"))) handleOtaUpload(); });
     webServer.onNotFound(handleNotFound);
     routesRegistered = true;
 }
@@ -2252,8 +2651,10 @@ static void serviceRecoveryActions() {
         reconnectRequested = false;
         if (!sensorConnected) {
             requestSensorRecovery(true, "Manual reconnect requested");
-        } else {
-            setUiMessage("Sensor already connected");
+        } else if (bleClient != nullptr) {
+            setUiMessage("Reconnecting sensor");
+            disconnectPending = true;
+            bleClient->disconnect();
         }
     }
 
@@ -2262,13 +2663,15 @@ static void serviceRecoveryActions() {
         cleanupSensorDevice();
         if (sensorConnected && bleClient != nullptr) {
             setUiMessage("Re-finding sensor");
+            scanAfterDisconnect = true;
+            disconnectPending = true;
             bleClient->disconnect();
         } else {
             requestSensorRecovery(false, "Manual scan requested");
         }
     }
 
-    if (doConnect) {
+    if (doConnect && !disconnectPending) {
         doConnect = false;
         recoveryState = RECOVERY_CONNECTING;
         stopBleScan();
@@ -2300,11 +2703,15 @@ void setup() {
     Serial.println("=========================================");
 
     pinMode(LED_PIN, OUTPUT);
+    pinMode(0, INPUT_PULLUP);
+    bootButtonArmed = digitalRead(0) == HIGH;
+    attachInterrupt(digitalPinToInterrupt(0), onBootButtonEdge, CHANGE);
     digitalWrite(LED_PIN, LOW);
     lastCrankMoveMs = millis();
     WiFi.persistent(false);
 
     buildDeviceId();
+    loadAdminPassword();
     loadCalibration();
     loadWiFiConfig();
     loadMqttConfig();
@@ -2326,8 +2733,10 @@ void setup() {
     }
 
     BLEDevice::init(BRIDGE_NAME);
+    BLEDevice::setCustomGattcHandler(onGattClientEventComplete);
     setupBLEServer();
     setupWebServer();
+    if (!adminConfigured) openSetupWindow();
 
     BLEScan* pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new SensorScanCallbacks());
@@ -2337,7 +2746,7 @@ void setup() {
 
     mqttClient.setBufferSize(1024);
 
-    if (wifiConfig.provisioned) {
+    if (wifiConfig.provisioned && !setupWindow) {
         beginWiFiConnect();
     }
 
@@ -2347,11 +2756,25 @@ void setup() {
 }
 
 void loop() {
-    if (configPortalRequested && millis() >= configPortalStartAtMs) {
-        configPortalRequested = false;
-        runWiFiManagerPortal();
+    portENTER_CRITICAL(&buttonMux);
+    bool buttonTriggered = bootButtonEvent || (bootButtonArmed && bootButtonPressed && millis() - bootButtonDown >= 5000);
+    if (buttonTriggered) {
+        bootButtonEvent = false;
+        bootButtonArmed = digitalRead(0) == HIGH;
+        bootButtonPressed = false;
     }
-
+    portEXIT_CRITICAL(&buttonMux);
+    if (buttonTriggered) openSetupWindow();
+    if (setupWindow && millis() - setupStarted >= 600000 && !restartPending) {
+        setupWindow = false;
+        stopAccessPoint();
+    }
+    if (sensorConnected && !disconnectPending && !tuneRequested &&
+        tuneState != TUNE_STANDARD_SENT && tuneState != TUNE_ENHANCED_SENT && lastSensorPacketMs != 0 &&
+        millis() - lastSensorPacketMs > 15000) {
+        setUiMessage("Sensor data timed out, reconnecting");
+        cleanupBleClient();
+    }
     ensureWiFiState();
     if (!wifiConfig.provisioned && sensorConnected) {
         startAccessPointIfNeeded();
@@ -2361,8 +2784,9 @@ void loop() {
         webServer.handleClient();
     }
     serviceTuneState();
-    serviceRecoveryActions();
-    ensureMqttState();
+    if (!setupWindow) serviceRecoveryActions();
+    if (!setupWindow) ensureMqttState();
+    else if (mqttClient.connected()) mqttClient.loop();
 
     if (restartPending && millis() >= restartAtMs) {
         delay(100);
